@@ -1,0 +1,373 @@
+# -*- coding: utf-8 -*-
+"""
+api_server.py —— 本地知识库 REST API（模块二）
+
+职责：
+    读取 D:\\KnowledgeBase 下所有 .md，解析 YAML Frontmatter + 正文，
+    按 date 倒序返回 JSON 给前端 Vue3。
+
+本次重构点：
+    1. 编码兼容：优先 UTF-8(含 BOM)，失败自动回退 GBK（老工具写的文件不会凭空消失）；
+    2. 内存缓存：以 (路径, mtime, size) 为键，文件没变就不重新解析 YAML；
+    3. 缓存自动清理：文件被删除后，对应缓存条目同步移除。
+
+接口：
+    GET /api/knowledge    全部知识条目（数组，最新在前）
+    GET /docs             FastAPI 自带交互文档
+
+启动（项目根目录 D:\\CodeBuddyWorkSpace\\wechat）：
+    .\\venv\\Scripts\\python.exe api_server.py
+    或：.\\venv\\Scripts\\python.exe -m uvicorn api_server:app --host 127.0.0.1 --port 8000 --reload
+
+依赖（若提示缺少 python-frontmatter）：
+    .\\venv\\Scripts\\pip.exe install fastapi uvicorn python-frontmatter
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import sys
+import threading
+from contextlib import asynccontextmanager
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
+except ImportError as exc:  # pragma: no cover
+    raise SystemExit(
+        f"缺少依赖（{exc}），请执行：\n"
+        r"    .\venv\Scripts\pip.exe install fastapi uvicorn"
+    )
+
+try:
+    import frontmatter
+except ImportError:  # pragma: no cover
+    raise SystemExit(
+        "缺少 python-frontmatter，请执行：\n"
+        r"    .\venv\Scripts\pip.exe install python-frontmatter"
+    )
+
+
+# =============================================================================
+# 配置区
+# =============================================================================
+KNOWLEDGE_DIR = Path(r"D:\KnowledgeBase")   # 知识库目录（模块一生成的 Markdown）
+SERVER_HOST = "127.0.0.1"                   # 本机调试；局域网访问可改 "0.0.0.0"
+SERVER_PORT = 8000
+DEFAULT_TYPE = "knowledge"                  # Frontmatter 缺 type 时的兜底值
+
+logger = logging.getLogger("kb_api")
+
+
+def _force_utf8_console() -> None:
+    """把控制台切到 UTF-8：Windows 默认 GBK，中文日志/报错会乱码。"""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_force_utf8_console()  # 必须在导入第三方库、抛出中文报错之前执行
+
+
+# =============================================================================
+# 数据模型
+# =============================================================================
+class KnowledgeItem(BaseModel):
+    filename: str        # 2026-11-02-跟张总开会.md
+    type: str            # schedule | knowledge
+    title: str
+    source: str          # 微信联系人
+    date: str            # YYYY-MM-DD HH:MM:SS
+    tags: list[str]
+    content: str
+
+
+# =============================================================================
+# 解析工具
+# =============================================================================
+_FILENAME_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+_FILENAME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+_FILENAME_SUFFIX = re.compile(r"-\d+$")
+_DATE_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d",
+)
+
+
+def coerce_datetime(value: Any) -> datetime | None:
+    """
+    把 Frontmatter 的 date 统一成 naive datetime。
+
+    PyYAML 可能给出 datetime / date，手写的可能是字符串，还可能是带时区的 ISO。
+    带时区的一律去掉 tzinfo，避免 aware 与 naive 混合比较抛 TypeError。
+    """
+    if isinstance(value, datetime):
+        dt: datetime | None = value
+    elif isinstance(value, date):  # datetime 是 date 子类，必须后判断
+        dt = datetime(value.year, value.month, value.day)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        dt = None
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            for fmt in _DATE_FORMATS:
+                try:
+                    dt = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+    else:
+        return None
+
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=None)
+
+
+def date_from_filename(path: Path) -> datetime | None:
+    match = _FILENAME_DATE.match(path.name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def resolve_date(raw: Any, path: Path) -> tuple[str, datetime]:
+    """展示用日期 + 排序用时间；兜底顺序：Frontmatter -> 文件名 -> 文件 mtime。"""
+    dt = coerce_datetime(raw) or date_from_filename(path)
+    if dt is None:
+        dt = datetime.fromtimestamp(path.stat().st_mtime)
+    return dt.strftime("%Y-%m-%d %H:%M:%S"), dt
+
+
+def title_from_filename(path: Path) -> str:
+    title = _FILENAME_SUFFIX.sub("", _FILENAME_PREFIX.sub("", path.stem)).strip()
+    return title or path.stem
+
+
+def as_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    return text or default
+
+
+def normalize_tags(value: Any) -> list[str]:
+    """数组原样；"a, b" 按逗号/分号拆分；None -> []。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts: Iterable[Any] = re.split(r"[,，;；]", value)
+    elif isinstance(value, (list, tuple, set)):
+        parts = value
+    else:
+        parts = [value]
+
+    tags: list[str] = []
+    for part in parts:
+        text = as_text(part)
+        if text and text not in tags:
+            tags.append(text)
+    return tags
+
+
+def read_markdown(path: Path) -> str:
+    """
+    读取 Markdown 文本。
+
+    先按 UTF-8(utf-8-sig 可吞掉 BOM) 解码；失败再尝试 GBK，
+    避免用记事本等工具保存的旧文件因为编码问题被永久跳过。
+    """
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        logger.warning("%s 不是 UTF-8 编码，已按 GBK 读取", path.name)
+        return raw.decode("gbk", errors="replace")
+
+
+def load_item(path: Path) -> tuple[datetime, KnowledgeItem]:
+    """
+    解析单个 Markdown，返回 (排序时间, 数据对象)。
+
+    YAML 语法错误、缺少 Frontmatter、正文为空等都会抛异常，
+    由 load_all_items 逐文件捕获，坏文件不会影响整个接口。
+    """
+    text = read_markdown(path)
+    post = frontmatter.loads(text)
+
+    meta = post.metadata or {}
+    if not isinstance(meta, dict):
+        raise ValueError("Frontmatter 不是键值对结构")
+    if not meta:
+        raise ValueError("缺少 YAML Frontmatter")
+
+    content = (post.content or "").strip()
+    if not content:
+        raise ValueError("正文为空")
+
+    date_text, sort_dt = resolve_date(meta.get("date"), path)
+    item = KnowledgeItem(
+        filename=path.name,
+        type=as_text(meta.get("type"), DEFAULT_TYPE),
+        title=as_text(meta.get("title")) or title_from_filename(path),
+        source=as_text(meta.get("source")),
+        date=date_text,
+        tags=normalize_tags(meta.get("tags")),
+        content=content,
+    )
+    return sort_dt, item
+
+
+# =============================================================================
+# 内存缓存：(路径, mtime, size) 不变就不重新解析
+# =============================================================================
+_CACHE: dict[str, tuple[tuple[float, int], tuple[datetime, KnowledgeItem]]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def load_item_cached(path: Path) -> tuple[datetime, KnowledgeItem]:
+    """带缓存的解析：文件修改时间与大小都没变，直接返回上次结果。"""
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ValueError(f"无法读取文件信息：{exc}") from exc
+
+    stamp = (stat.st_mtime, stat.st_size)
+    key = str(path)
+
+    with _CACHE_LOCK:
+        cached = _CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+
+    parsed = load_item(path)
+
+    with _CACHE_LOCK:
+        _CACHE[key] = (stamp, parsed)
+    return parsed
+
+
+def prune_cache(existing_keys: set[str]) -> None:
+    """删除已经不存在的文件对应的缓存，防止长期运行时内存只增不减。"""
+    with _CACHE_LOCK:
+        for key in [k for k in _CACHE if k not in existing_keys]:
+            _CACHE.pop(key, None)
+
+
+def load_all_items() -> list[KnowledgeItem]:
+    """扫描知识库目录，解析全部 .md（走缓存）并按日期倒序返回。"""
+    if not KNOWLEDGE_DIR.exists():
+        logger.warning("知识库目录不存在：%s", KNOWLEDGE_DIR)
+        return []
+
+    records: list[tuple[datetime, KnowledgeItem]] = []
+    existing: set[str] = set()
+    skipped = 0
+
+    for path in KNOWLEDGE_DIR.glob("*.md"):
+        if not path.is_file():
+            continue
+        existing.add(str(path))
+        try:
+            records.append(load_item_cached(path))
+        except Exception as exc:
+            # 单个文件有问题只记录告警，绝不让整个请求 500
+            skipped += 1
+            logger.warning(
+                "跳过无法解析的文件：%s（%s: %s）", path.name, type(exc).__name__, exc
+            )
+
+    prune_cache(existing)
+
+    records.sort(key=lambda pair: (pair[0], pair[1].filename), reverse=True)
+    logger.debug("共解析 %d 条，跳过 %d 条异常文件", len(records), skipped)
+    return [item for _, item in records]
+
+
+# =============================================================================
+# FastAPI 应用
+# =============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("知识库目录：%s（存在：%s）", KNOWLEDGE_DIR, KNOWLEDGE_DIR.exists())
+    logger.info("接口地址：http://%s:%d/api/knowledge", SERVER_HOST, SERVER_PORT)
+    logger.info("接口文档：http://%s:%d/docs", SERVER_HOST, SERVER_PORT)
+    yield
+    logger.info("服务已关闭")
+
+
+app = FastAPI(
+    title="微信知识库 API",
+    description="读取本地 Markdown 知识库，向前端提供结构化 JSON 数据",
+    version="1.1.0",
+    lifespan=lifespan,
+)
+
+# CORS：本地 Vue 开发服务器（如 http://localhost:5173）需要跨域调用。
+# allow_origins=["*"] 时 allow_credentials 必须为 False，否则浏览器会拒绝。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get(
+    "/api/knowledge",
+    response_model=list[KnowledgeItem],
+    summary="获取全部知识条目（按日期倒序）",
+)
+def get_knowledge() -> list[KnowledgeItem]:
+    """
+    读取 D:\\KnowledgeBase 下全部 .md 并返回数组。
+
+    FastAPI 默认用 UTF-8 序列化 JSON（ensure_ascii=False），中文不会被转义。
+    """
+    return load_all_items()
+
+
+# =============================================================================
+# 启动入口
+# =============================================================================
+def setup_logging() -> None:
+    _force_utf8_console()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+if __name__ == "__main__":
+    setup_logging()
+    uvicorn.run(
+        "api_server:app",          # reload 模式必须传导入字符串
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        reload=True,               # 改代码自动重启
+        reload_dirs=[os.path.dirname(os.path.abspath(__file__))],
+        log_level="info",
+    )

@@ -1,0 +1,12 @@
+# Python 虚拟环境
+venv/
+__pycache__/
+*.pyc
+
+# 极其重要：环境变量与密钥
+.env
+
+# 运行时生成的数据
+.processed.jsonl
+*.log
+wxauto_bak/
