@@ -78,6 +78,7 @@ except ImportError:  # pragma: no cover
 # #############################################################################
 OUTPUT_DIR = Path(r"D:\KnowledgeBase")
 IMAGES_DIR = OUTPUT_DIR / "images"
+STAGING_DIR = OUTPUT_DIR / ".staging"
 PROCESSED_FILE = OUTPUT_DIR / ".processed.jsonl"
 MANIFEST_FILE = OUTPUT_DIR / ".manifest.jsonl"
 LOG_PATH = OUTPUT_DIR / "ingest.log"
@@ -547,7 +548,8 @@ class Pipeline:
         else:
             doc_type, title = result
 
-        attachments = self._materialize_attachments(batch.attachments, batch.when)
+        staged, run_dir = self._stage_attachments(batch.attachments, batch.when)
+        attachments = [rel for _src, rel in staged]
 
         body = text
         if batch.sender:
@@ -563,9 +565,18 @@ class Pipeline:
                 len(attachments),
                 batch.channel,
             )
+            self._cleanup_staging(run_dir)
             return
 
-        path = self._write_markdown(doc_type, title, batch, body, attachments)
+        try:
+            path = self._write_markdown(doc_type, title, batch, body, attachments)
+        except Exception:
+            # Markdown 没写成，临时图片全部清掉，避免孤儿
+            self._cleanup_staging(run_dir)
+            raise
+
+        # Markdown 已经原子落盘，再把图片移入 images/
+        self._finalize_attachments(staged, run_dir)
 
         for _t, fp in batch.parts:
             self.store.add(fp, path.name, batch.source, batch.when)
@@ -588,14 +599,21 @@ class Pipeline:
         )
         LOG.info("已归档 [%s] %s（%d 条合并）", doc_type, path, len(batch.parts))
 
-    def _materialize_attachments(
+    def _stage_attachments(
         self, attachments: list[str], when: datetime
-    ) -> list[str]:
-        result: list[str] = []
+    ) -> tuple[list[tuple[Path, str]], Path | None]:
+        """
+        把附件复制到 .staging，返回 [(临时路径, Markdown 相对路径)]。
+        Markdown 写成功后才 os.replace 到 images/；失败则整个临时目录删除。
+        """
+        staged: list[tuple[Path, str]] = []
         if not attachments:
-            return result
+            return staged, None
 
         IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        run_dir = STAGING_DIR / uuid.uuid4().hex
+        run_dir.mkdir(parents=True, exist_ok=True)
+
         for raw in attachments:
             src = Path(raw)
             if not src.is_file():
@@ -603,15 +621,36 @@ class Pipeline:
                 continue
             try:
                 if src.parent.resolve() == IMAGES_DIR.resolve():
-                    result.append(f"./images/{src.name}")
+                    # 已经是最终文件，不需要再搬
+                    staged.append((src, f"./images/{src.name}"))
                     continue
-                name = f"{when.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{src.name}"
-                dst = IMAGES_DIR / name
+                name = (
+                    f"{when.strftime('%Y%m%d-%H%M%S')}-"
+                    f"{uuid.uuid4().hex[:6]}-{src.name}"
+                )
+                dst = run_dir / name
                 shutil.copy2(src, dst)
-                result.append(f"./images/{name}")
+                staged.append((dst, f"./images/{name}"))
             except OSError:
-                LOG.exception("复制附件失败：%s", src)
-        return result
+                LOG.exception("暂存附件失败：%s", src)
+        return staged, run_dir
+
+    def _cleanup_staging(self, run_dir: Path | None) -> None:
+        if run_dir is not None:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+    def _finalize_attachments(
+        self, staged: list[tuple[Path, str]], run_dir: Path | None
+    ) -> None:
+        for src, rel in staged:
+            final = IMAGES_DIR / Path(rel).name
+            if src.resolve() == final.resolve():
+                continue
+            try:
+                os.replace(src, final)
+            except OSError:
+                LOG.exception("移动附件失败：%s -> %s", src, final)
+        self._cleanup_staging(run_dir)
 
     def _write_markdown(
         self,

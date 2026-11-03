@@ -3,33 +3,30 @@ chcp 65001 >nul
 setlocal EnableExtensions
 
 rem ============================================================
-rem 安装开机自启：在当前用户 Startup 目录创建快捷方式
-rem 删除用 uninstall_autostart.bat
+rem 安装开机自启：写用户环境变量 + 通用引导脚本
+rem 不再把绝对路径写死在快捷方式里；项目移动后重跑本脚本即可
 rem ============================================================
 
 set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-set "LNK=%STARTUP%\WeChatKB.lnk"
+set "LAUNCHER=%STARTUP%\WeChatKB.cmd"
 
-if not exist "%ROOT%start_tray.vbs" (
-    echo [错误] 没找到 start_tray.vbs
-    pause
+if not exist "%ROOT%\autostart_launcher.cmd" (
+    echo [错误] 没找到 autostart_launcher.cmd
+    if /i not "%~1"=="--silent" pause
     exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ws = New-Object -ComObject WScript.Shell; " ^
-  "$sc = $ws.CreateShortcut('%LNK%'); " ^
-  "$sc.TargetPath = '%WINDIR%\System32\wscript.exe'; " ^
-  "$q = [char]34; $sc.Arguments = $q + '%ROOT%start_tray.vbs' + $q; " ^
-  "$sc.WorkingDirectory = '%ROOT%'; " ^
-  "$sc.Description = '微信知识库采集托盘'; " ^
-  "$sc.Save()"
+setx WECHAT_KB_HOME "%ROOT%" >nul
+copy /y "%ROOT%\autostart_launcher.cmd" "%LAUNCHER%" >nul
+if exist "%STARTUP%\WeChatKB.lnk" del /f /q "%STARTUP%\WeChatKB.lnk"
 
-if exist "%LNK%" (
-    echo [OK] 已安装开机自启：%LNK%
+if exist "%LAUNCHER%" (
+    echo [OK] 已安装开机自启：%LAUNCHER%
+    echo [OK] WECHAT_KB_HOME=%ROOT%
 ) else (
-    echo [失败] 快捷方式没有创建成功
+    echo [失败] 引导脚本没有复制成功
 )
-pause
+if /i not "%~1"=="--silent" pause
 endlocal

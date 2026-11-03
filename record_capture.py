@@ -30,6 +30,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -47,13 +48,14 @@ from PIL import Image, ImageChops, ImageGrab
 
 OUTPUT_DIR = Path(r"D:\KnowledgeBase")
 IMAGES_DIR = OUTPUT_DIR / "images"
-PROCESSED_FILE = OUTPUT_DIR / ".processed.jsonl"
+STAGING_ROOT = OUTPUT_DIR / ".staging"
+WORK_IMAGES_DIR = IMAGES_DIR
 
 # OCR 前把截图放大，Windows OCR 对小字号中文的识别率会明显提升
 OCR_ZOOM = 2
 
 # 记录窗口内部最多向下扫描几屏（用于找全图片/发送者）
-MAX_VISUAL_PAGES = 8
+MAX_VISUAL_PAGES = 20
 
 
 # =============================================================================
@@ -236,10 +238,10 @@ def capture_window(hwnd: int) -> Image.Image:
 
 
 def save_page_image(image: Image.Image, when: datetime) -> str:
-    """保存整页截图到 images 目录，返回 Markdown 可用的相对路径。"""
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    """保存整页截图到本次运行的临时目录，返回 Markdown 相对路径。"""
+    WORK_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     name = f"record-{when.strftime('%Y%m%d-%H%M%S')}.png"
-    path = IMAGES_DIR / name
+    path = WORK_IMAGES_DIR / name
     image.save(path, format="PNG")
     return f"./images/{name}"
 
@@ -375,11 +377,11 @@ def save_image_original(
             print("  [警告] 没有出现保存对话框")
             return None
 
-        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-        target = IMAGES_DIR / f"record-image-{when.strftime('%Y%m%d-%H%M%S')}.png"
+        WORK_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        target = WORK_IMAGES_DIR / f"record-image-{when.strftime('%Y%m%d-%H%M%S')}.png"
         index = 2
         while target.exists():
-            target = IMAGES_DIR / (
+            target = WORK_IMAGES_DIR / (
                 f"record-image-{when.strftime('%Y%m%d-%H%M%S')}-{index}.png"
             )
             index += 1
@@ -482,7 +484,7 @@ def _dedup_asset_files(paths: list[str]) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for rel in paths:
-        path = IMAGES_DIR / Path(rel).name
+        path = WORK_IMAGES_DIR / Path(rel).name
         if not path.is_file():
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -535,8 +537,11 @@ def collect_visual_assets(
     originals: list[str] = []
     current = first
     scrolled = 0
+    max_pages = max(1, int(getattr(args, "max_visual_pages", MAX_VISUAL_PAGES)))
+    notches = max(1, int(getattr(args, "visual_scroll_notches", 12)))
+    prev_texts = {box[4] for box in asyncio.run(ocr_boxes(current))}
 
-    while scrolled < MAX_VISUAL_PAGES:
+    while scrolled < max_pages:
         if not args.no_sender_crops:
             try:
                 headers.extend(save_sender_header_crops(current, when))
@@ -552,7 +557,7 @@ def collect_visual_assets(
                 except Exception as exc:
                     print(f"  [警告] 保存原图失败：{exc}")
 
-        _scroll_record(hwnd, -120, 4)
+        _scroll_record(hwnd, -120, notches)
         scrolled += 1
         time.sleep(0.9)
         nxt = capture_window(hwnd)
@@ -560,11 +565,19 @@ def collect_visual_assets(
         diff = ImageChops.difference(current.convert("L"), nxt.convert("L"))
         data = diff.tobytes()
         mean = sum(data) / max(1, len(data))
-        if mean <= 0.5:
-            break
-        current = nxt
 
-    _scroll_record(hwnd, 120, 4 * scrolled)
+        next_texts = {box[4] for box in asyncio.run(ocr_boxes(nxt))}
+        if not next_texts:
+            print("  OCR 没有文本，判定已到底")
+            break
+        if not (next_texts - prev_texts) and mean <= 1.0:
+            print("  OCR 文本无新增且画面趋于稳定，判定已到底")
+            break
+
+        current = nxt
+        prev_texts = next_texts
+
+    _scroll_record(hwnd, 120, notches * scrolled)
     time.sleep(0.6)
     print(f"  记录窗口共扫描 {scrolled} 屏")
     return image_rel, _dedup_asset_files(headers), _dedup_asset_files(originals)
@@ -622,13 +635,13 @@ def save_sender_header_crops(image: Image.Image, when: datetime) -> list[str]:
         else:
             merged.append(box)
 
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    WORK_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
     stamp = when.strftime("%Y%m%d-%H%M%S")
     for index, (top, _left, right, bottom) in enumerate(merged, start=1):
         crop = image.crop((0, top, right, bottom))
         name = f"record-header-{stamp}-{index}.png"
-        crop.save(IMAGES_DIR / name, format="PNG")
+        crop.save(WORK_IMAGES_DIR / name, format="PNG")
         paths.append(f"./images/{name}")
     return paths
 
@@ -952,116 +965,8 @@ def collect_text(
 
 
 # =============================================================================
-# 落盘
+# 落盘已全部交给 ingest.py；这里不再保留独立 Markdown 写入逻辑
 # =============================================================================
-def atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        raise
-
-
-def next_available_path(title: str, when: datetime) -> Path:
-    stem = f"{when.strftime('%Y-%m-%d')}-{title or '未命名'}"
-    path = OUTPUT_DIR / f"{stem}.md"
-    if not path.exists():
-        return path
-    for index in range(2, 10000):
-        candidate = OUTPUT_DIR / f"{stem}-{index}.md"
-        if not candidate.exists():
-            return candidate
-    raise RuntimeError("同名文件过多")
-
-
-def fingerprint(text: str, when: datetime) -> str:
-    return hashlib.sha256(
-        f"record|{text}|{when.strftime('%Y-%m-%d')}".encode("utf-8")
-    ).hexdigest()
-
-
-def load_processed() -> set[str]:
-    processed: set[str] = set()
-    if not PROCESSED_FILE.exists():
-        return processed
-    with PROCESSED_FILE.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict) and isinstance(record.get("fp"), str):
-                processed.add(record["fp"])
-    return processed
-
-
-def append_processed(fp: str, filename: str, when: datetime) -> None:
-    record = {
-        "fp": fp,
-        "file": filename,
-        "source": "群聊的聊天记录",
-        "date": when.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    PROCESSED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(PROCESSED_FILE, "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-
-
-def save_markdown(
-    text: str,
-    when: datetime,
-    image_rel: str | None = None,
-    header_images: list[str] | None = None,
-    original_images: list[str] | None = None,
-) -> Path:
-    title = f"合并转发-{when.strftime('%m%d-%H%M')}"
-    tags = ["微信采集", "合并转发"]
-    frontmatter = [
-        "---",
-        "type: knowledge",
-        f"title: {json.dumps(title, ensure_ascii=False)}",
-        f"source: {json.dumps('群聊的聊天记录', ensure_ascii=False)}",
-        f"date: {when.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"tags: {json.dumps(tags, ensure_ascii=False)}",
-        "---",
-    ]
-
-    parts = ["\n".join(frontmatter), text.rstrip()]
-
-    if original_images:
-        lines = ["**记录内图片（原图）**", ""]
-        for index, path in enumerate(original_images, start=1):
-            lines.append(f"![原图{index}]({path})")
-        parts.append("\n".join(lines))
-
-    if header_images:
-        lines = ["**发送者（头像 + 昵称 + 时间）**", ""]
-        for index, path in enumerate(header_images, start=1):
-            lines.append(f"![发送者{index}]({path})")
-        parts.append("\n".join(lines))
-
-    if image_rel:
-        parts.append(f"![记录截图]({image_rel})")
-    body = "\n\n".join(parts) + "\n"
-
-    path = next_available_path(title, when)
-    atomic_write_text(path, body)
-    return path
 
 
 # =============================================================================
@@ -1091,12 +996,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="不保存记录内图片的原图（默认会检测并保存）",
     )
     parser.add_argument(
+        "--max-visual-pages",
+        type=int,
+        default=20,
+        help="记录窗口最多向下扫描几屏（默认 20）",
+    )
+    parser.add_argument(
+        "--visual-scroll-notches",
+        type=int,
+        default=12,
+        help="每屏向下滚动几格（默认 12，约保留 30%% 重叠）",
+    )
+    parser.add_argument(
         "--ingest",
         action="store_true",
         help="交给 ingest 统一管线落盘（推荐，chat_watcher 使用）",
     )
     parser.add_argument("--source", default="锦", help="来源会话名")
+    parser.add_argument(
+        "--record-hwnd",
+        default="",
+        help="指定记录窗口句柄（十六进制/十进制），供 chat_watcher 精确绑定",
+    )
     return parser.parse_args(argv)
+
+
+def cleanup_work_images() -> None:
+    """只清理本次运行的 .staging 子目录，绝不碰正式 images/。"""
+    if (
+        WORK_IMAGES_DIR != IMAGES_DIR
+        and WORK_IMAGES_DIR.parent == STAGING_ROOT
+    ):
+        shutil.rmtree(WORK_IMAGES_DIR, ignore_errors=True)
 
 
 def submit_to_ingest(
@@ -1120,7 +1051,7 @@ def submit_to_ingest(
         original_images or []
     )
     for rel in all_images:
-        path = IMAGES_DIR / Path(rel).name
+        path = WORK_IMAGES_DIR / Path(rel).name
         if path.is_file():
             attachments.append(str(path))
 
@@ -1138,23 +1069,42 @@ def submit_to_ingest(
         return 0
     finally:
         pipeline.close()
+        cleanup_work_images()
 
 
 def main(argv: list[str] | None = None) -> int:
+    global WORK_IMAGES_DIR
+
     prepare_stdout()
     args = parse_args(argv)
     enable_dpi_awareness()
 
-    windows = find_record_windows()
-    if not windows:
-        print("没有找到「聊天记录」窗口。请先双击打开一个群聊的合并转发记录。")
-        return 1
+    if not args.dry_run:
+        # 本次抓取的图片先放临时目录，Markdown 写成功后才由 ingest 移入 images/
+        WORK_IMAGES_DIR = STAGING_ROOT / f"record-{uuid.uuid4().hex[:8]}"
 
-    print(f"找到 {len(windows)} 个记录窗口：")
-    for hwnd, title in windows:
-        print(f"  hwnd=0x{hwnd:X} title={title!r}")
+    if args.record_hwnd:
+        try:
+            hwnd = int(args.record_hwnd, 0)
+        except ValueError:
+            print(f"无效的 --record-hwnd：{args.record_hwnd!r}")
+            return 1
+        if not win32gui.IsWindow(hwnd):
+            print(f"指定的记录窗口不存在：0x{hwnd:X}")
+            return 1
+        title = win32gui.GetWindowText(hwnd)
+        print(f"使用指定记录窗口：hwnd=0x{hwnd:X} title={title!r}")
+    else:
+        windows = find_record_windows()
+        if not windows:
+            print("没有找到「聊天记录」窗口。请先双击打开一个群聊的合并转发记录。")
+            return 1
 
-    hwnd, title = windows[0]
+        print(f"找到 {len(windows)} 个记录窗口：")
+        for item_hwnd, item_title in windows:
+            print(f"  hwnd=0x{item_hwnd:X} title={item_title!r}")
+
+        hwnd, title = windows[0]
     if not focus_window(hwnd):
         return 2
 
@@ -1199,22 +1149,20 @@ def main(argv: list[str] | None = None) -> int:
     print(text[:1500])
     print("-" * 70)
 
-    # 先判重：内容已归档过就不再保存原图，避免产生孤儿图片
+    # 先判重：内容已归档过就不再保存原图，避免产生孤儿图片。
+    # 写盘/去重已全部交给 ingest，这里只做“提前判重”避免白存图。
     duplicate = False
-    if args.ingest:
-        try:
-            import ingest
+    try:
+        import ingest
 
-            store = ingest.FingerprintStore(ingest.PROCESSED_FILE)
-            # 必须和 Pipeline.submit 用同一套归一化，否则 hash 对不上
-            normalized = ingest.normalize_text(text)
-            duplicate = (
-                ingest.content_fingerprint(args.source, normalized, when) in store
-            )
-        except Exception:
-            duplicate = False
-    else:
-        duplicate = fingerprint(text, when) in load_processed()
+        store = ingest.FingerprintStore(ingest.PROCESSED_FILE)
+        # 必须和 Pipeline.submit 用同一套归一化，否则 hash 对不上
+        normalized = ingest.normalize_text(text)
+        duplicate = (
+            ingest.content_fingerprint(args.source, normalized, when) in store
+        )
+    except Exception:
+        duplicate = False
 
     if duplicate:
         print("  内容已归档过，跳过原图保存")
@@ -1229,25 +1177,10 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"  [警告] 视觉资产采集失败：{exc}")
 
-    if args.ingest:
-        return submit_to_ingest(
-            text, image_rel, header_images, when, args, original_images
-        )
-
-    if args.dry_run:
-        print("[DRY-RUN] 不写文件")
-        return 0
-
-    fp = fingerprint(text, when)
-    processed = load_processed()
-    if fp in processed:
-        print("同样内容今天已经归档过，跳过（不重复写文件）。")
-        return 0
-
-    path = save_markdown(text, when, image_rel, header_images, original_images)
-    append_processed(fp, path.name, when)
-    print(f"\n已归档：{path}")
-    return 0
+    # 唯一写盘入口：ingest。不再保留 record_capture 自己的 Markdown 写入分支。
+    return submit_to_ingest(
+        text, image_rel, header_images, when, args, original_images
+    )
 
 
 if __name__ == "__main__":

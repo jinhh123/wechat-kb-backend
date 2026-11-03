@@ -50,6 +50,7 @@ SEEN_FILE = OUTPUT_DIR / ".watcher_seen.json"
 LOG_PATH = OUTPUT_DIR / "chat_watcher.log"
 
 CARD_TITLE = "群聊的聊天记录"
+EXPECTED_CHAT = "锦"
 IDLE_THRESHOLD_SECONDS = 180
 
 LOG = logging.getLogger("chat_watcher")
@@ -188,13 +189,39 @@ class Card:
     signature: str
 
 
+def looks_like_card_title(text: str) -> bool:
+    """
+    单聊记录的标题是「张三和李四的聊天记录」，群聊是「群聊的聊天记录」；
+    卡片底部还有一个纯「聊天记录」的按钮，必须排除。
+    """
+    value = (text or "").strip()
+    if value == "聊天记录":
+        return False
+    return "聊天记录" in value
+
+
+def current_chat_name(image) -> str:
+    """从主窗口顶部右侧读当前聊天标题（微信 4.x 自绘，只能 OCR）。"""
+    boxes = asyncio.run(rc.ocr_boxes(image))
+    candidates: list[str] = []
+    for top, left, _right, _bottom, text in boxes:
+        if top > image.height * 0.16:
+            continue
+        if left < image.width * 0.30:
+            continue
+        value = (text or "").strip()
+        if value:
+            candidates.append(value)
+    return candidates[0] if candidates else ""
+
+
 def scan_cards_from_image(image) -> list[Card]:
     boxes = asyncio.run(rc.ocr_boxes(image))
     cards: list[Card] = []
 
     for box in boxes:
         top, left, _right, _bottom, text = box
-        if CARD_TITLE not in text:
+        if not looks_like_card_title(text):
             continue
         if left <= image.width * 0.35:  # 只认右侧聊天区
             continue
@@ -253,12 +280,15 @@ def double_click_card(hwnd: int, image, box: tuple[float, float, float, float, s
         win32api.SetCursorPos(old_pos)
 
 
-def wait_for_record_window(timeout: float = 8.0) -> int | None:
+def wait_for_new_record_window(
+    existing: set[int], timeout: float = 8.0
+) -> int | None:
+    """只返回双击之后新出现的记录窗口，绝不盲取列表第一个。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        windows = rc.find_record_windows()
-        if windows:
-            return windows[0][0]
+        for hwnd, _title in rc.find_record_windows():
+            if hwnd not in existing:
+                return hwnd
         time.sleep(0.3)
     return None
 
@@ -291,7 +321,20 @@ def run(args: argparse.Namespace) -> int:
     time.sleep(0.5)
 
     image, cards = scan_cards(hwnd)
-    LOG.info("当前窗口：%r，检测到 %d 张聊天记录卡片", title, len(cards))
+    chat_name = current_chat_name(image)
+    if chat_name != EXPECTED_CHAT:
+        LOG.error(
+            "当前聊天是 %r，不是 %r，已跳过本轮（防止抓错会话）",
+            chat_name or "<未识别>",
+            EXPECTED_CHAT,
+        )
+        return 0
+
+    LOG.info(
+        "当前聊天：%s，检测到 %d 张聊天记录卡片",
+        chat_name,
+        len(cards),
+    )
 
     if not cards and not args.scroll_history:
         LOG.warning("没有检测到「群聊的聊天记录」；请先打开「锦」的聊天窗口")
@@ -340,7 +383,8 @@ def run(args: argparse.Namespace) -> int:
     def pick_pending(cards: list[Card]) -> list[Card]:
         result: list[Card] = []
         for card in cards:
-            if card.signature in processed_signatures:
+            # 即使 --all，本轮已经处理过的卡也绝不重复双击
+            if is_signature_seen(card.signature, processed_signatures):
                 continue
             # 顶部坐标太接近，说明是同一张卡（已读后红点消失会导致签名变化）
             if any(abs(card.box[0] - top) <= 40 for top in processed_tops):
@@ -393,16 +437,25 @@ def run(args: argparse.Namespace) -> int:
         processed_signatures.add(card.signature)
         processed_tops.append(card.box[0])
         LOG.info("处理卡片：top=%.0f", card.box[0])
-        double_click_card(hwnd, image, card.box)
 
-        record_hwnd = wait_for_record_window()
+        # 先清掉所有遗留记录窗口，避免抓到旧窗口
+        close_record_windows()
+        time.sleep(0.4)
+        existing = {h for h, _t in rc.find_record_windows()}
+
+        double_click_card(hwnd, image, card.box)
+        record_hwnd = wait_for_new_record_window(existing)
         if record_hwnd is None:
-            LOG.error("双击后没有出现记录窗口，标记跳过")
+            LOG.error("双击后没有出现新的记录窗口，标记跳过")
             seen.add(card.signature)
             continue
 
         try:
-            argv = ["--ingest"] + (["--dry-run"] if args.dry_run else [])
+            argv = [
+                "--ingest",
+                "--record-hwnd",
+                hex(record_hwnd),
+            ] + (["--dry-run"] if args.dry_run else [])
             code = rc.main(argv)
             LOG.info("record_capture 返回：%s", code)
             seen.add(card.signature)
