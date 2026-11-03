@@ -39,7 +39,7 @@ FRONTEND_DIST = Path(
 API_BASE = "http://127.0.0.1:8000"
 FRONTEND_URL = API_BASE + "/console"
 KNOWLEDGE_URL = API_BASE + "/knowledge"
-ICON_PATH = ROOT / "app.ico"
+ICON_PATH = ROOT / "app_control.ico"
 
 BG = "#f3f6fb"
 CARD = "#ffffff"

@@ -295,6 +295,12 @@ D:\KnowledgeBase\
 
 ---
 
+## 说明书
+
+- v1.1 Word：`D:\KnowledgeBase\微信知识库采集-使用说明-v1.1.docx`
+- v1.1 PDF：`D:\KnowledgeBase\微信知识库采集-使用说明-v1.1.pdf`
+- v1.0 原版 Word/PDF 保留，不覆盖。
+
 ## 仓库
 
 <https://github.com/jinhh123/wechat-kb-backend>
