@@ -28,6 +28,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import socket
+import subprocess
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -37,8 +39,10 @@ from typing import Any, Iterable
 
 try:
     import uvicorn
-    from fastapi import FastAPI
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
@@ -54,11 +58,19 @@ except ImportError:  # pragma: no cover
         r"    .\venv\Scripts\pip.exe install python-frontmatter"
     )
 
+try:
+    import status_bus
+except ImportError:
+    status_bus = None
+
 
 # =============================================================================
 # 配置区
 # =============================================================================
 KNOWLEDGE_DIR = Path(r"D:\KnowledgeBase")   # 知识库目录（模块一生成的 Markdown）
+FRONTEND_DIST = Path(
+    os.environ.get("KB_FRONTEND_DIST", r"C:\dev\notice-to-calendar\dist")
+)  # Vue 构建产物；可用 KB_FRONTEND_DIST 覆盖
 SERVER_HOST = "127.0.0.1"                   # 本机调试；局域网访问可改 "0.0.0.0"
 SERVER_PORT = 8000
 DEFAULT_TYPE = "knowledge"                  # Frontmatter 缺 type 时的兜底值
@@ -90,6 +102,10 @@ class KnowledgeItem(BaseModel):
     date: str            # YYYY-MM-DD HH:MM:SS
     tags: list[str]
     content: str
+
+
+class ControlCommand(BaseModel):
+    command: str
 
 
 # =============================================================================
@@ -335,6 +351,79 @@ app.add_middleware(
 )
 
 
+def _port_open(port: int, timeout: float = 0.2) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _tray_online(data: dict[str, Any]) -> bool:
+    if not data.get("running"):
+        return False
+    updated = str(data.get("updated_at") or "")
+    if not updated:
+        return False
+    try:
+        stamp = datetime.strptime(updated, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return (datetime.now() - stamp).total_seconds() <= 8
+
+
+@app.get("/api/health", summary="本地服务健康检查")
+def health() -> dict[str, Any]:
+    return {"ok": True, "service": "wechat-kb-api"}
+
+
+@app.get("/api/status", summary="采集器、托盘、前端运行状态")
+def get_status() -> dict[str, Any]:
+    data = status_bus.read_status() if status_bus is not None else {}
+    data = dict(data or {})
+    data["api_online"] = True
+    data["tray_online"] = _tray_online(data)
+    data["frontend_online"] = FRONTEND_DIST.is_dir() or _port_open(5173)
+    data["frontend_url"] = "/console"
+    data["server_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return data
+
+
+@app.post("/api/control", summary="向托盘发送扫描/暂停命令")
+def control(cmd: ControlCommand) -> dict[str, Any]:
+    if status_bus is None:
+        raise HTTPException(status_code=503, detail="status_bus 不可用")
+    command = (cmd.command or "").strip()
+    allowed = {"scan", "toggle_pause", "open_panel"}
+    if command not in allowed:
+        raise HTTPException(status_code=400, detail=f"不支持的命令：{command}")
+
+    if command == "open_panel":
+        panel = Path(__file__).with_name("status_panel.py")
+        subprocess.Popen(
+            [sys.executable, str(panel)],
+            cwd=str(Path(__file__).parent),
+            close_fds=True,
+        )
+    else:
+        status_bus.send_command(command)
+    return {"ok": True, "command": command}
+
+
+@app.post("/api/open/{target}", summary="打开日志或知识库目录")
+def open_target(target: str) -> dict[str, Any]:
+    if target == "log":
+        path = KNOWLEDGE_DIR / "tray_app.log"
+    elif target == "folder":
+        path = KNOWLEDGE_DIR
+    else:
+        raise HTTPException(status_code=400, detail="target 只能是 log 或 folder")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"不存在：{path}")
+    os.startfile(str(path))  # type: ignore[attr-defined]
+    return {"ok": True, "path": str(path)}
+
+
 @app.get(
     "/api/knowledge",
     response_model=list[KnowledgeItem],
@@ -347,6 +436,37 @@ def get_knowledge() -> list[KnowledgeItem]:
     FastAPI 默认用 UTF-8 序列化 JSON（ensure_ascii=False），中文不会被转义。
     """
     return load_all_items()
+
+
+# =============================================================================
+# Vue 构建产物（可选）：dist 存在时，直接由 8000 端口提供 /console、/knowledge
+# =============================================================================
+if FRONTEND_DIST.is_dir():
+    _assets = FRONTEND_DIST / "assets"
+    if _assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_frontend(full_path: str):
+        if full_path.startswith("api/") or full_path in {
+            "docs",
+            "redoc",
+            "openapi.json",
+        }:
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        root = FRONTEND_DIST.resolve()
+        candidate = (root / full_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Not Found")
+        if full_path and candidate.is_file():
+            return FileResponse(str(candidate))
+        index = root / "index.html"
+        if index.is_file():
+            return FileResponse(str(index))
+        raise HTTPException(status_code=404, detail="前端构建产物不存在")
 
 
 # =============================================================================
@@ -364,10 +484,9 @@ def setup_logging() -> None:
 if __name__ == "__main__":
     setup_logging()
     uvicorn.run(
-        "api_server:app",          # reload 模式必须传导入字符串
+        "api_server:app",
         host=SERVER_HOST,
         port=SERVER_PORT,
-        reload=True,               # 改代码自动重启
-        reload_dirs=[os.path.dirname(os.path.abspath(__file__))],
+        reload=False,              # 常驻服务不启 reload，避免 pythonw 下多进程
         log_level="info",
     )

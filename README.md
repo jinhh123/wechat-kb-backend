@@ -69,6 +69,9 @@ cd D:\CodeBuddyWorkSpace\wechat
 
 # 或双击
 start_tray.bat
+
+# 推荐：打开桌面管家（含一键启动全部）
+start_control_center.bat
 ```
 
 开机自启：
@@ -82,6 +85,69 @@ install_autostart.bat
 ```powershell
 uninstall_autostart.bat
 ```
+
+---
+
+## 桌面管家与 Vue 控制台
+
+### 桌面管家
+
+双击桌面上的 **微信知识库管家**，或运行：
+
+```powershell
+.\venv\Scripts\pythonw.exe control_center.py
+```
+
+窗口里可以直接：
+
+- 一键启动本地 API、托盘和前端；
+- 打开 Vue 控制台 / 知识库；
+- 立即扫描、暂停/恢复、打开状态面板；
+- 打开日志、知识库目录；
+- 查看托盘/API/前端、当前聊天、队列、倒计时、自检。
+
+重新生成桌面快捷方式：
+
+```powershell
+.\venv\Scripts\python.exe control_center.py --install-shortcut
+```
+
+### Vue 控制台
+
+Vue 源码在 `C:\dev\notice-to-calendar`，新增路由：
+
+```
+http://127.0.0.1:8000/console     # 控制台
+http://127.0.0.1:8000/knowledge   # 知识库
+```
+
+`api_server.py` 会直接托管 `dist/` 构建产物，所以日常不需要启动 Vite：
+
+```powershell
+cd C:\dev\notice-to-calendar
+npm run build
+```
+
+修改前端后重新 build 即可。开发模式仍可：
+
+```powershell
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+前端路径可用环境变量覆盖：
+
+```powershell
+set KB_FRONTEND_DIR=C:\dev\notice-to-calendar
+set KB_FRONTEND_DIST=C:\dev\notice-to-calendar\dist
+```
+
+API 新增：
+
+- `GET /api/health`
+- `GET /api/status`
+- `POST /api/control`（`scan` / `toggle_pause` / `open_panel`）
+- `POST /api/open/log`
+- `POST /api/open/folder`
 
 ---
 
