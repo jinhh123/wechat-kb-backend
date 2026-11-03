@@ -43,7 +43,7 @@ import win32con
 import win32gui
 import win32process
 import win32ui
-from PIL import Image, ImageGrab
+from PIL import Image, ImageChops, ImageGrab
 
 OUTPUT_DIR = Path(r"D:\KnowledgeBase")
 IMAGES_DIR = OUTPUT_DIR / "images"
@@ -51,6 +51,9 @@ PROCESSED_FILE = OUTPUT_DIR / ".processed.jsonl"
 
 # OCR 前把截图放大，Windows OCR 对小字号中文的识别率会明显提升
 OCR_ZOOM = 2
+
+# 记录窗口内部最多向下扫描几屏（用于找全图片/发送者）
+MAX_VISUAL_PAGES = 8
 
 
 # =============================================================================
@@ -460,6 +463,111 @@ def detect_image_regions(image) -> list[tuple[int, int, int, int]]:
             continue
         result.append(box)
     return result
+
+
+def _scroll_record(hwnd: int, delta: int, notches: int = 4) -> None:
+    """向记录窗口发送滚轮消息（不移动鼠标）。"""
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    x = left + int((right - left) / 2)
+    y = top + int((bottom - top) / 2)
+    lparam = win32api.MAKELONG(x, y)
+    wparam = (delta << 16) & 0xFFFFFFFF
+    for _ in range(notches):
+        win32gui.PostMessage(hwnd, win32con.WM_MOUSEWHEEL, wparam, lparam)
+        time.sleep(0.08)
+
+
+def _dedup_asset_files(paths: list[str]) -> list[str]:
+    """按文件内容去重，跨屏重复出现的同一张图只保留一份。"""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for rel in paths:
+        path = IMAGES_DIR / Path(rel).name
+        if not path.is_file():
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest in seen:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        seen.add(digest)
+        unique.append(rel)
+    return unique
+
+
+def collect_visual_assets(
+    hwnd: int, when: datetime, args: argparse.Namespace
+) -> tuple[str | None, list[str], list[str]]:
+    """
+    从记录窗口顶部逐屏向下扫描，收集：
+        - 首屏整页截图
+        - 每屏的发送者头像/昵称裁剪
+        - 每屏检测到的图片原图
+    结束后滚回顶部。
+
+    正文仍以 Ctrl+A 剪贴板为准，这里只补视觉资产。
+    """
+    if args.dry_run:
+        return None, [], []
+
+    # Ctrl+Home 是全局按键，先确保记录窗口在前台，避免发到别的程序
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    _press_ctrl(0x24)  # VK_HOME
+    time.sleep(0.6)
+    first = capture_window(hwnd)
+
+    image_rel: str | None = None
+    try:
+        image_rel = save_page_image(first, when)
+    except Exception as exc:
+        print(f"  [警告] 保存整页截图失败：{exc}")
+
+    if args.no_original_images and args.no_sender_crops:
+        return image_rel, [], []
+
+    headers: list[str] = []
+    originals: list[str] = []
+    current = first
+    scrolled = 0
+
+    while scrolled < MAX_VISUAL_PAGES:
+        if not args.no_sender_crops:
+            try:
+                headers.extend(save_sender_header_crops(current, when))
+            except Exception as exc:
+                print(f"  [警告] 裁剪发送者区域失败：{exc}")
+
+        if not args.no_original_images:
+            for box in detect_image_regions(current):
+                try:
+                    rel = save_image_original(hwnd, box, when)
+                    if rel:
+                        originals.append(rel)
+                except Exception as exc:
+                    print(f"  [警告] 保存原图失败：{exc}")
+
+        _scroll_record(hwnd, -120, 4)
+        scrolled += 1
+        time.sleep(0.9)
+        nxt = capture_window(hwnd)
+
+        diff = ImageChops.difference(current.convert("L"), nxt.convert("L"))
+        data = diff.tobytes()
+        mean = sum(data) / max(1, len(data))
+        if mean <= 0.5:
+            break
+        current = nxt
+
+    _scroll_record(hwnd, 120, 4 * scrolled)
+    time.sleep(0.6)
+    print(f"  记录窗口共扫描 {scrolled} 屏")
+    return image_rel, _dedup_asset_files(headers), _dedup_asset_files(originals)
 
 
 def _looks_like_time(text: str) -> bool:
@@ -1051,7 +1159,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     image = capture_window(hwnd)
-    layout_image = image
     when = datetime.now()
     image_rel: str | None = None
     header_images: list[str] = []
@@ -1063,24 +1170,6 @@ def main(argv: list[str] | None = None) -> int:
     if clip_text:
         text = clip_text
         print("  剪贴板抓取成功（原文，无 OCR 错字）")
-
-        # 记录窗口可能停在中间；Ctrl+Home 回到顶部，保证发送者头像/时间可见
-        _press_ctrl(0x24)  # VK_HOME
-        time.sleep(0.5)
-        top_image = capture_window(hwnd)
-        layout_image = top_image
-
-        if not args.dry_run:
-            try:
-                image_rel = save_page_image(top_image, when)
-            except Exception as exc:
-                print(f"  [警告] 保存整页截图失败：{exc}")
-            if not args.no_sender_crops:
-                try:
-                    header_images = save_sender_header_crops(top_image, when)
-                    print(f"  发送者裁剪结果：{len(header_images)} 张")
-                except Exception as exc:
-                    print(f"  [警告] 裁剪发送者区域失败：{exc}")
     else:
         print("  剪贴板抓取失败，回退截图 OCR…")
         original_rect = None
@@ -1101,7 +1190,6 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if original_rect:
                 restore_window(hwnd, original_rect)
-        layout_image = capture_window(hwnd)
 
     if not text:
         print("没有识别到文字（窗口可能是空白，或 OCR 语言包缺失）。")
@@ -1130,15 +1218,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if duplicate:
         print("  内容已归档过，跳过原图保存")
-    elif not args.no_original_images:
-        boxes = detect_image_regions(layout_image)
-        if boxes:
-            print(f"  检测到 {len(boxes)} 张图片，开始保存原图…")
-            for box in boxes:
-                rel = save_image_original(hwnd, box, when, dry_run=args.dry_run)
-                if rel:
-                    original_images.append(rel)
-            print(f"  原图保存结果：{len(original_images)}/{len(boxes)}")
+    elif not args.dry_run:
+        try:
+            image_rel, header_images, original_images = collect_visual_assets(
+                hwnd, when, args
+            )
+            print(
+                f"  视觉资产：发送者 {len(header_images)} 张，原图 {len(original_images)} 张"
+            )
+        except Exception as exc:
+            print(f"  [警告] 视觉资产采集失败：{exc}")
 
     if args.ingest:
         return submit_to_ingest(
