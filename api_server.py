@@ -25,6 +25,7 @@ api_server.py —— 本地知识库 REST API（模块二）
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import re
@@ -41,7 +42,7 @@ try:
     import uvicorn
     from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError as exc:  # pragma: no cover
@@ -67,6 +68,31 @@ except ImportError:
 # =============================================================================
 # 配置区
 # =============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _load_local_env() -> None:
+    path = PROJECT_ROOT / ".env"
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key.strip(), value)
+
+
+_load_local_env()
+LOCAL_API_TOKEN = os.environ.get("LOCAL_API_TOKEN", "").strip()
+ALLOWED_ORIGINS = [
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+]
+
 KNOWLEDGE_DIR = Path(r"D:\KnowledgeBase")   # 知识库目录（模块一生成的 Markdown）
 FRONTEND_DIST = Path(
     os.environ.get("KB_FRONTEND_DIST", r"C:\dev\notice-to-calendar\dist")
@@ -102,8 +128,10 @@ class KnowledgeItem(BaseModel):
     date: str            # YYYY-MM-DD HH:MM:SS
     tags: list[str]
     content: str
-    category: str = "未分类"
+    category: str = ""
     is_merged: bool = False
+    merged_into: str = ""
+    merged_from: list[str] = []
 
 
 class ControlCommand(BaseModel):
@@ -271,8 +299,10 @@ def load_item(path: Path) -> tuple[datetime, KnowledgeItem]:
         date=date_text,
         tags=normalize_tags(meta.get("tags")),
         content=content,
-        category=as_text(meta.get("category"), "未分类"),
+        category=as_text(meta.get("category")),
         is_merged=bool(meta.get("is_merged", False)),
+        merged_into=as_text(meta.get("merged_into")),
+        merged_from=normalize_tags(meta.get("merged_from")),
     )
     return sort_dt, item
 
@@ -362,14 +392,36 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS：本地 Vue 开发服务器（如 http://localhost:5173）需要跨域调用。
-# allow_origins=["*"] 时 allow_credentials 必须为 False，否则浏览器会拒绝。
+# 写操作必须带本地 Token。放在 CORS 之前注册，让 CORS 成为外层，
+# 这样 401 响应也会带 Access-Control-Allow-Origin，前端能看到真实错误。
+@app.middleware("http")
+async def require_local_token(request, call_next):
+    if (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and request.url.path.startswith("/api/")
+    ):
+        if not LOCAL_API_TOKEN:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "LOCAL_API_TOKEN 未配置，写操作已禁用"},
+            )
+        provided = request.headers.get("authorization", "")
+        expected = f"Bearer {LOCAL_API_TOKEN}"
+        if not hmac.compare_digest(provided, expected):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "本地 API Token 无效"},
+            )
+    return await call_next(request)
+
+
+# CORS 只允许本机前端；不再使用 "*"，避免任意网页读写本地知识库。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 
@@ -443,10 +495,14 @@ def _knowledge_path(filename: str) -> Path:
     return path
 
 
-def _write_post(path: Path, post: frontmatter.Post) -> None:
+def _write_text_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8", newline="\n")
+    tmp.write_text(text, encoding="utf-8", newline="\n")
     os.replace(tmp, path)
+
+
+def _write_post(path: Path, post: frontmatter.Post) -> None:
+    _write_text_atomic(path, frontmatter.dumps(post) + "\n")
 
 
 @app.post("/api/knowledge/category", response_model=KnowledgeItem, summary="把分类写回 Markdown")
@@ -465,6 +521,12 @@ def add_link(req: LinkRequest) -> KnowledgeItem:
     url = (req.url or "").strip()
     if not re.match(r"^https?://", url, re.I):
         raise HTTPException(status_code=400, detail="只支持 http/https 链接")
+
+    # 同一个 URL 只保留一张卡，避免重复粘贴生成一堆重复条目
+    for existing in load_all_items():
+        if url in existing.content:
+            return existing
+
     title = (req.title or "").strip() or url
     body = f"[{title}]({url})\n\n{url}"
     now = datetime.now()
@@ -532,16 +594,28 @@ def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
         target = KNOWLEDGE_DIR / f"{stem}-{index}.md"
         index += 1
 
+    # 先备份原文件原文，标记失败时整体回滚
+    backups = {path: read_markdown(path) for path in paths}
     _write_post(target, post)
 
-    # 原卡片保留，但打上 is_merged 标记
-    for path in paths:
-        try:
-            original = frontmatter.loads(read_markdown(path))
+    try:
+        for path in paths:
+            original = frontmatter.loads(backups[path])
             original["is_merged"] = True
+            original["merged_into"] = target.name
             _write_post(path, original)
-        except Exception:
-            logger.exception("标记 is_merged 失败：%s", path.name)
+    except Exception as exc:
+        logger.exception("合并回滚：标记原卡片失败")
+        for path, text in backups.items():
+            try:
+                _write_text_atomic(path, text)
+            except Exception:
+                logger.exception("恢复原卡片失败：%s", path.name)
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("删除未完成合并卡片失败：%s", target.name)
+        raise HTTPException(status_code=500, detail="合并失败，已回滚") from exc
 
     _, created = load_item(target)
     return created
