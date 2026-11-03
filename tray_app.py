@@ -1,0 +1,408 @@
+# -*- coding: utf-8 -*-
+"""
+tray_app.py —— 常驻托盘：空闲扫描 + 全局热键
+
+整合：
+    - chat_watcher：空闲时扫描「锦」会话里的「群聊的聊天记录」，自动打开/抓取/关闭；
+    - hotkey_capture：Ctrl+Alt+K 采集剪贴板文字/图片；
+    - ingest：统一去重、防抖、AI 分类、Markdown 落盘。
+
+托盘菜单：
+    暂停/恢复监听、立即扫描 (Ctrl+Alt+S)、查看日志、退出。
+
+全局热键：
+    Ctrl+Alt+K  采集剪贴板文字/图片
+    Ctrl+Alt+S  忽略空闲，遍历当前窗口全部记录卡片
+
+防抢鼠标：
+    - 自动扫描只在系统空闲超过 180 秒时执行；
+    - 检测到用户正在操作（空闲 < 5 秒）直接跳过本轮；
+    - 「立即扫描」是人工触发，会忽略空闲限制，但仍在后台线程执行。
+
+运行：
+    .\\venv\\Scripts\\pythonw.exe tray_app.py          # 无黑框常驻
+    .\\venv\\Scripts\\python.exe  tray_app.py --dry-run # 调试，不写文件
+    .\\venv\\Scripts\\python.exe  tray_app.py --help
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import logging
+import os
+import sys
+import threading
+import time
+from ctypes import wintypes
+from pathlib import Path
+from typing import Any
+
+import pystray
+import win32api
+import win32con
+import win32event
+import winerror
+from PIL import Image, ImageDraw
+
+import chat_watcher
+import hotkey_capture
+import ingest
+
+OUTPUT_DIR = ingest.OUTPUT_DIR
+LOG_PATH = OUTPUT_DIR / "tray_app.log"
+
+HOTKEY_ID = 0xB002
+SCAN_HOTKEY_ID = 0xB003
+VK_K = 0x4B
+VK_S = 0x53
+DEFAULT_IDLE_THRESHOLD = 180
+DEFAULT_SCAN_INTERVAL = 60
+BUSY_WINDOW_SECONDS = 5.0
+
+MUTEX_NAME = r"Global\WeChatKB_TrayApp_SingleInstance"
+_INSTANCE_MUTEX = None
+
+LOG = logging.getLogger("tray_app")
+
+
+def _ensure_streams() -> None:
+    """pythonw.exe 下 sys.stdout/stderr 为 None，print/log 会抛异常，统一兜底。"""
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+def setup_logging() -> None:
+    if LOG.handlers:
+        return
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+    if sys.stdout is not None:
+        console = logging.StreamHandler(sys.stdout)
+        console.setFormatter(formatter)
+        LOG.addHandler(console)
+
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(formatter)
+        LOG.addHandler(handler)
+    except OSError:
+        pass
+
+
+# =============================================================================
+# 图片原图通道（占位）
+# =============================================================================
+def capture_image_original(hwnd: int, box: tuple[int, int, int, int]) -> str | None:
+    """
+    TODO（等托盘跑通后实现）：
+        1. 在记录窗口里双击图片，等待图片预览窗口；
+        2. 发送 Ctrl+S 或点击「保存」；
+        3. 在文件对话框里填入 D:\\KnowledgeBase\\images\\xxx.png；
+        4. 回车保存，Esc 关闭预览；
+        5. 返回原图路径。
+
+    当前仅预留接口，不执行任何点击。
+    """
+    LOG.info("图片原图通道尚未实现（hwnd=%s box=%s）", hwnd, box)
+    return None
+
+
+# =============================================================================
+# 托盘应用
+# =============================================================================
+class TrayApp:
+    def __init__(self, dry_run: bool = False, idle_threshold: int = DEFAULT_IDLE_THRESHOLD,
+                 scan_interval: int = DEFAULT_SCAN_INTERVAL) -> None:
+        self.dry_run = dry_run
+        self.idle_threshold = idle_threshold
+        self.scan_interval = scan_interval
+
+        self.paused = threading.Event()
+        self.stop_event = threading.Event()
+        self.ui_lock = threading.Lock()      # 扫描与热键互斥，避免剪贴板冲突
+        self.scan_lock = threading.Lock()    # 防止重复扫描
+        self.pipeline: ingest.Pipeline | None = None
+        self.icon: pystray.Icon | None = None
+        self.hotkey_thread: threading.Thread | None = None
+        self.hotkey_thread_id: int | None = None
+        self._closed = False
+
+    # ------------------------------------------------------------------ 生命周期
+    def run(self) -> int:
+        setup_logging()
+        self.pipeline = ingest.Pipeline(dry_run=self.dry_run)
+
+        self.hotkey_thread = threading.Thread(
+            target=self._hotkey_loop, name="hotkey", daemon=True
+        )
+        self.hotkey_thread.start()
+
+        threading.Thread(target=self._scan_loop, name="scanner", daemon=True).start()
+
+        self.icon = pystray.Icon(
+            "wechat_kb",
+            self._icon_image(),
+            "微信知识库采集",
+            self._menu(),
+        )
+        LOG.info(
+            "托盘已启动：空闲阈值 %d 秒，扫描间隔 %d 秒，dry_run=%s",
+            self.idle_threshold,
+            self.scan_interval,
+            self.dry_run,
+        )
+        self.icon.run()
+        self._shutdown()
+        return 0
+
+    def _shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.stop_event.set()
+        self._stop_hotkey()
+        if self.hotkey_thread is not None:
+            self.hotkey_thread.join(timeout=3)
+        if self.pipeline is not None:
+            try:
+                self.pipeline.close()
+            except Exception:
+                LOG.exception("关闭 ingest 失败")
+        LOG.info("托盘已退出")
+
+    # ------------------------------------------------------------------ 菜单
+    def _menu(self) -> pystray.Menu:
+        return pystray.Menu(
+            pystray.MenuItem(
+                lambda item: "恢复监听" if self.paused.is_set() else "暂停监听",
+                self._toggle_pause,
+            ),
+            pystray.MenuItem("立即扫描 (Ctrl+Alt+S)", self._scan_now),
+            pystray.MenuItem("查看日志", self._open_log),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("退出", self._quit),
+        )
+
+    def _icon_image(self) -> Image.Image:
+        image = Image.new("RGB", (64, 64), (255, 255, 255))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((4, 4, 60, 60), radius=16, fill=(7, 193, 96))
+        draw.text((16, 21), "KB", fill="white")
+        return image
+
+    def _toggle_pause(self, icon: pystray.Icon, item: Any) -> None:
+        if self.paused.is_set():
+            self.paused.clear()
+            LOG.info("已恢复监听")
+        else:
+            self.paused.set()
+            LOG.info(
+                "已暂停监听（Ctrl+Alt+K 与自动扫描停止；"
+                "手动「立即扫描」和 Ctrl+Alt+S 仍可用）"
+            )
+        icon.update_menu()
+
+    def _scan_now(self, icon: pystray.Icon, item: Any) -> None:
+        LOG.info("手动触发扫描：遍历当前可见的全部卡片")
+        threading.Thread(
+            target=self._run_scan,
+            kwargs={"force": True, "all_cards": True},
+            name="scan-now",
+            daemon=True,
+        ).start()
+
+    def _open_log(self, icon: pystray.Icon, item: Any) -> None:
+        target = chat_watcher.LOG_PATH
+        if not target.exists():
+            target = OUTPUT_DIR
+        try:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        except Exception:
+            LOG.exception("打开日志失败：%s", target)
+
+    def _quit(self, icon: pystray.Icon, item: Any) -> None:
+        LOG.info("收到退出指令")
+        self.stop_event.set()
+        self._stop_hotkey()
+        icon.stop()
+
+    # ------------------------------------------------------------------ 扫描
+    def _scan_loop(self) -> None:
+        # 启动后先缓 10 秒，避免和登录/开机动作抢鼠标
+        if self.stop_event.wait(10):
+            return
+
+        while not self.stop_event.is_set():
+            if self.paused.is_set():
+                self.stop_event.wait(self.scan_interval)
+                continue
+
+            idle = chat_watcher.idle_seconds()
+            if idle < BUSY_WINDOW_SECONDS:
+                LOG.info("用户正在操作（空闲 %.1f 秒），跳过本轮", idle)
+            elif idle < self.idle_threshold:
+                LOG.info(
+                    "空闲不足 %d 秒（当前 %.0f 秒），本轮不点击鼠标",
+                    self.idle_threshold,
+                    idle,
+                )
+            else:
+                self._run_scan(force=False)
+
+            self.stop_event.wait(self.scan_interval)
+
+    def _run_scan(self, force: bool, all_cards: bool = False) -> None:
+        if self.stop_event.is_set():
+            return
+        if not self.scan_lock.acquire(blocking=False):
+            LOG.info("已有扫描在进行，跳过")
+            return
+
+        try:
+            with self.ui_lock:
+                argv = ["--process"]
+                if force:
+                    argv.append("--force")
+                if all_cards:
+                    argv.append("--all")
+                if self.dry_run:
+                    argv.append("--dry-run")
+                LOG.info("开始扫描：%s", " ".join(argv))
+                code = chat_watcher.run(chat_watcher.parse_args(argv))
+                LOG.info("扫描结束，返回 %s", code)
+        except Exception:
+            LOG.exception("扫描异常")
+        finally:
+            self.scan_lock.release()
+
+    # ------------------------------------------------------------------ 热键
+    def _hotkey_loop(self) -> None:
+        user32 = ctypes.windll.user32
+        self.hotkey_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+
+        modifiers = win32con.MOD_CONTROL | win32con.MOD_ALT
+        hotkeys = [
+            (HOTKEY_ID, VK_K, "Ctrl+Alt+K（剪贴板采集）"),
+            (SCAN_HOTKEY_ID, VK_S, "Ctrl+Alt+S（强制扫描全部卡片）"),
+        ]
+
+        registered: list[int] = []
+        for hotkey_id, vk, label in hotkeys:
+            if user32.RegisterHotKey(None, hotkey_id, modifiers, vk):
+                registered.append(hotkey_id)
+                LOG.info("热键已注册：%s", label)
+            else:
+                LOG.error("注册热键失败：%s（可能已被其他程序占用）", label)
+
+        if not registered:
+            LOG.error("所有热键都注册失败，热键功能不可用")
+            return
+
+        msg = wintypes.MSG()
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message != win32con.WM_HOTKEY:
+                    continue
+                if msg.wParam == HOTKEY_ID:
+                    self._on_hotkey()
+                elif msg.wParam == SCAN_HOTKEY_ID:
+                    self._on_scan_hotkey()
+        finally:
+            for hotkey_id in registered:
+                user32.UnregisterHotKey(None, hotkey_id)
+            LOG.info("热键已注销")
+
+    def _on_hotkey(self) -> None:
+        if self.paused.is_set():
+            LOG.info("已暂停监听，忽略 Ctrl+Alt+K")
+            return
+        try:
+            with self.ui_lock:
+                ok = hotkey_capture.handle_clipboard(self.pipeline, self.dry_run)
+            LOG.info("热键处理完成：%s", "submitted" if ok else "empty/duplicate")
+        except Exception:
+            LOG.exception("热键处理失败")
+
+    def _on_scan_hotkey(self) -> None:
+        """Ctrl+Alt+S：忽略空闲检测，遍历当前可见的全部卡片。"""
+        LOG.info("收到 Ctrl+Alt+S：强制扫描全部可见卡片（忽略空闲）")
+        threading.Thread(
+            target=self._run_scan,
+            kwargs={"force": True, "all_cards": True},
+            name="scan-hotkey",
+            daemon=True,
+        ).start()
+
+    def _stop_hotkey(self) -> None:
+        if not self.hotkey_thread_id:
+            return
+        try:
+            ctypes.windll.user32.PostThreadMessageW(
+                self.hotkey_thread_id, win32con.WM_QUIT, 0, 0
+            )
+        except Exception:
+            LOG.exception("停止热键线程失败")
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="微信知识库采集托盘程序")
+    parser.add_argument("--dry-run", action="store_true", help="不写 Markdown")
+    parser.add_argument(
+        "--idle-threshold", type=int, default=DEFAULT_IDLE_THRESHOLD,
+        help="自动扫描所需空闲秒数（默认 180）",
+    )
+    parser.add_argument(
+        "--scan-interval", type=int, default=DEFAULT_SCAN_INTERVAL,
+        help="两次自动扫描间隔秒数（默认 60）",
+    )
+    return parser.parse_args(argv)
+
+
+def acquire_single_instance():
+    """命名互斥：防止开了两个托盘，互相抢 Ctrl+Alt+K。"""
+    handle = win32event.CreateMutex(None, False, MUTEX_NAME)
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        win32api.CloseHandle(handle)
+        return None
+    return handle
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _INSTANCE_MUTEX
+
+    _ensure_streams()
+    args = parse_args(argv)
+
+    _INSTANCE_MUTEX = acquire_single_instance()
+    if _INSTANCE_MUTEX is None:
+        setup_logging()
+        LOG.error("已有托盘实例在运行，本实例退出（避免热键/扫描冲突）")
+        return 0
+
+    app = TrayApp(
+        dry_run=args.dry_run,
+        idle_threshold=args.idle_threshold,
+        scan_interval=args.scan_interval,
+    )
+    return app.run()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

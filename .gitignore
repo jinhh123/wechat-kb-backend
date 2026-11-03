@@ -10,3 +10,9 @@ __pycache__/
 .processed.jsonl
 *.log
 wxauto_bak/
+wechatauto_logs/
+
+# 本地归档（不进仓库）
+wechat_collector_DEPRECATED.py.bak
+start_collector_DEPRECATED.bat.bak
+_tmp*
