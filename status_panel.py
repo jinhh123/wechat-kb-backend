@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import tkinter as tk
-from datetime import datetime
 from pathlib import Path
 
 import status_bus
@@ -39,8 +39,8 @@ class StatusPanel:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("微信知识库采集 · 状态")
-        self.root.geometry("540x760")
-        self.root.minsize(520, 700)
+        self.root.geometry("540x820")
+        self.root.minsize(520, 760)
         self.root.configure(bg=COLOR_BG)
 
         self.topmost_var = tk.BooleanVar(value=False)
@@ -49,6 +49,9 @@ class StatusPanel:
         self.chat_var = tk.StringVar(value="-")
         self.scan_var = tk.StringVar(value="-")
         self.message_var = tk.StringVar(value="-")
+        self.queue_var = tk.StringVar(value="0 条")
+        self.countdown_var = tk.StringVar(value="-")
+        self.self_check_var = tk.StringVar(value="微信 UI：未检查")
         self.today_var = tk.StringVar(value="0")
         self.hotkey_var = tk.StringVar(value="-")
         self.updated_var = tk.StringVar(value="-")
@@ -139,6 +142,19 @@ class StatusPanel:
         self._line(status_card, "当前聊天", self.chat_var)
         self._line(status_card, "上次记录扫描", self.scan_var)
         self._line(status_card, "上次消息扫描", self.message_var)
+        self._line(status_card, "队列深度", self.queue_var)
+        self._line(status_card, "下次任务", self.countdown_var)
+        self.self_check_label = tk.Label(
+            status_card,
+            textvariable=self.self_check_var,
+            bg=COLOR_CARD,
+            fg=COLOR_RED,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            anchor="w",
+            wraplength=460,
+            justify="left",
+        )
+        self.self_check_label.pack(fill="x", padx=14, pady=(2, 4))
         self._line(status_card, "今日归档", self.today_var)
         self._line(status_card, "热键", self.hotkey_var)
         self._line(status_card, "状态更新", self.updated_var)
@@ -258,6 +274,10 @@ class StatusPanel:
             self.game_var.set("🎮 全屏应用：未知")
             self.game_label.configure(fg=COLOR_MUTED)
             self.chat_var.set("托盘未运行")
+            self.queue_var.set("-")
+            self.countdown_var.set("-")
+            self.self_check_var.set("微信 UI：未连接")
+            self.self_check_label.configure(fg=COLOR_MUTED)
             self.updated_var.set("-")
             return
 
@@ -282,6 +302,40 @@ class StatusPanel:
         else:
             self.game_var.set("🎮 全屏应用：否")
             self.game_label.configure(fg=COLOR_GREEN)
+
+        now = time.time()
+
+        def remain(key: str) -> int:
+            try:
+                epoch = float(data.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+            return max(0, int(round(epoch - now))) if epoch > 0 else 0
+
+        self.queue_var.set(f"{int(data.get('queue_depth') or 0)} 条")
+        pause_reason = _fmt(data.get("auto_pause_reason"), "")
+        if pause_reason:
+            self.countdown_var.set(f"自动暂停：{pause_reason}")
+        else:
+            self.countdown_var.set(
+                f"记录 {remain('next_scan_epoch')}s / "
+                f"消息 {remain('next_message_epoch')}s"
+            )
+        due = remain("aggregate_due_epoch")
+        if due > 0:
+            self.countdown_var.set(
+                f"{self.countdown_var.get()} / 聚合 {due}s"
+            )
+
+        if data.get("self_check_error"):
+            self.self_check_var.set(f"⚠ {data['self_check_error']}")
+            self.self_check_label.configure(fg=COLOR_RED)
+        elif data.get("self_check_ok"):
+            self.self_check_var.set("微信 UI：正常")
+            self.self_check_label.configure(fg=COLOR_GREEN)
+        else:
+            self.self_check_var.set("微信 UI：自检中…")
+            self.self_check_label.configure(fg=COLOR_MUTED)
 
         self.chat_var.set(_fmt(data.get("current_chat"), "未识别"))
         self.scan_var.set(_fmt(data.get("last_scan_at"), "尚未扫描"))

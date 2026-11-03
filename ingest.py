@@ -414,6 +414,11 @@ class Pipeline:
         self.accepted = 0
         self._processed_count = 0
 
+    def pending_count(self) -> int:
+        """待防抖批次 + 后台处理中的任务数。"""
+        with self._lock:
+            return len(self._buffers) + len(self._futures)
+
     # ------------------------------------------------------------------ 提交
     def submit(self, item: IngestItem) -> bool:
         text = normalize_text(item.text)

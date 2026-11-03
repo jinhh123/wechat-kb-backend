@@ -54,6 +54,8 @@ from focus_guard import ForegroundGuard
 import hotkey_capture
 import ingest
 import message_watcher
+import runtime_policy
+import self_check
 import status_bus
 
 OUTPUT_DIR = ingest.OUTPUT_DIR
@@ -149,6 +151,9 @@ class TrayApp:
         self.hotkey_thread_id: int | None = None
         self.game_mode = False
         self.game_reason = ""
+        self.auto_pause_reason = ""
+        self.next_scan_epoch = 0.0
+        self.next_message_epoch = 0.0
         self._closed = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -172,6 +177,20 @@ class TrayApp:
             last_error="",
             today_archived=self._today_count(),
             recent_files=self._recent_files(),
+            auto_pause_reason="",
+            queue_depth=0,
+            next_scan_epoch=0,
+            next_message_epoch=0,
+            self_check_ok=False,
+            self_check_error="",
+        )
+
+        ok, message = self_check.run()
+        if not ok:
+            LOG.error("微信 UI 自检失败：%s", message)
+        status_bus.write_status(
+            self_check_ok=ok,
+            self_check_error="" if ok else message,
         )
 
         self.hotkey_thread = threading.Thread(
@@ -185,6 +204,12 @@ class TrayApp:
         ).start()
         threading.Thread(
             target=self._game_loop, name="game-guard", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._status_loop, name="status", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._self_check_loop, name="self-check", daemon=True
         ).start()
         threading.Thread(
             target=self._command_loop, name="commands", daemon=True
@@ -365,12 +390,21 @@ class TrayApp:
     # ------------------------------------------------------------------ 扫描
     def _scan_loop(self) -> None:
         # 启动后先缓 10 秒，避免和登录/开机动作抢鼠标
+        self.next_scan_epoch = time.time() + 10
         if self.stop_event.wait(10):
             return
 
         scans = 0
         while not self.stop_event.is_set():
             if self.paused.is_set():
+                self.next_scan_epoch = time.time() + self.scan_interval
+                self.stop_event.wait(self.scan_interval)
+                continue
+
+            self._update_auto_pause()
+            if self.auto_pause_reason:
+                LOG.info("自动策略暂停（%s），本轮不扫描", self.auto_pause_reason)
+                self.next_scan_epoch = time.time() + self.scan_interval
                 self.stop_event.wait(self.scan_interval)
                 continue
 
@@ -379,6 +413,7 @@ class TrayApp:
                     "全屏/游戏模式（%s），自动记录扫描挂起",
                     self.game_reason or "全屏应用",
                 )
+                self.next_scan_epoch = time.time() + self.scan_interval
                 self.stop_event.wait(self.scan_interval)
                 continue
 
@@ -397,7 +432,60 @@ class TrayApp:
                 if scans % 10 == 0:
                     gc.collect()
 
+            self.next_scan_epoch = time.time() + self.scan_interval
             self.stop_event.wait(self.scan_interval)
+
+    def _update_auto_pause(self) -> None:
+        reason = runtime_policy.auto_pause_reason()
+        if reason == self.auto_pause_reason:
+            return
+        self.auto_pause_reason = reason
+        if reason:
+            LOG.warning("进入自动暂停：%s", reason)
+        else:
+            LOG.info("夜间/电池自动暂停已解除")
+        status_bus.write_status(auto_pause_reason=reason)
+
+    def _self_check_loop(self) -> None:
+        if self.stop_event.wait(60):
+            return
+        while not self.stop_event.is_set():
+            if not self.game_mode:
+                try:
+                    ok, message = self_check.run()
+                except Exception as exc:
+                    ok, message = False, f"微信 UI 自检异常：{exc}"
+                if not ok:
+                    LOG.error("微信 UI 自检失败：%s", message)
+                status_bus.write_status(
+                    self_check_ok=ok,
+                    self_check_error="" if ok else message,
+                )
+            self.stop_event.wait(60)
+
+    def _status_loop(self) -> None:
+        """每秒刷新队列深度和倒计时，供 Tkinter 面板读取。"""
+        while not self.stop_event.wait(1.0):
+            self._update_auto_pause()
+            queue = 0
+            due_epoch = 0.0
+            if self.pipeline is not None:
+                queue += self.pipeline.pending_count()
+            if self.message_watcher is not None:
+                try:
+                    queue += self.message_watcher.aggregator.queue_depth()
+                    due_epoch = self.message_watcher.aggregator.due_epoch()
+                except Exception:
+                    pass
+            status_bus.write_status(
+                queue_depth=queue,
+                next_scan_epoch=self.next_scan_epoch,
+                next_message_epoch=self.next_message_epoch,
+                aggregate_due_epoch=due_epoch,
+                auto_pause_reason=self.auto_pause_reason,
+                game_mode=self.game_mode,
+                game_reason=self.game_reason,
+            )
 
     def _game_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -423,11 +511,14 @@ class TrayApp:
 
     def _message_loop(self) -> None:
         """轻量消息轮询：每 15 秒只做 OCR，不点击、不抢焦点。"""
+        self.next_message_epoch = time.time() + 15
         if self.stop_event.wait(15):
             return
 
         while not self.stop_event.is_set():
-            if self.paused.is_set() or self.game_mode:
+            self._update_auto_pause()
+            if self.paused.is_set() or self.game_mode or self.auto_pause_reason:
+                self.next_message_epoch = time.time() + 15
                 self.stop_event.wait(15)
                 continue
 
@@ -441,6 +532,7 @@ class TrayApp:
                     self.game_mode = True
                     self.game_reason = reason
                     status_bus.write_status(game_mode=True, game_reason=reason)
+                self.next_message_epoch = time.time() + 15
                 self.stop_event.wait(15)
                 continue
 
@@ -452,6 +544,7 @@ class TrayApp:
                 LOG.exception("轻量消息轮询失败")
                 status_bus.write_status(last_error="轻量消息轮询失败")
 
+            self.next_message_epoch = time.time() + 15
             self.stop_event.wait(15)
 
     def _run_scan(

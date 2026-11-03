@@ -166,6 +166,7 @@ class MessageAggregator:
         self._timer: threading.Timer | None = None
         self._submissions: list[float] = []
         self._total_submissions = 0
+        self._due_epoch = 0.0
         self._closed = False
 
     def add(self, text: str, image: str | None = None) -> None:
@@ -183,6 +184,7 @@ class MessageAggregator:
 
             if self._timer is not None:
                 self._timer.cancel()
+            self._due_epoch = time.time() + AGGREGATE_SECONDS
             self._timer = threading.Timer(AGGREGATE_SECONDS, self._flush)
             self._timer.daemon = True
             self._timer.start()
@@ -199,6 +201,7 @@ class MessageAggregator:
             self._parts.clear()
             self._image = None
             self._timer = None
+            self._due_epoch = 0.0
 
         text = "\n".join(parts).strip()
         if len(text) > MAX_TEXT_LEN:
@@ -247,12 +250,21 @@ class MessageAggregator:
                 last_message_result="已提交聚合",
             )
 
+    def queue_depth(self) -> int:
+        with self._lock:
+            return len(self._parts) + (1 if self._image else 0)
+
+    def due_epoch(self) -> float:
+        with self._lock:
+            return self._due_epoch if (self._parts or self._image) else 0.0
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
             if self._timer is not None:
                 self._timer.cancel()
             has_content = bool(self._parts or self._image)
+            self._due_epoch = 0.0
         if has_content:
             self._flush()
 
