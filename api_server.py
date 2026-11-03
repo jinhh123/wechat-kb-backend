@@ -29,6 +29,7 @@ import hmac
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -94,6 +95,7 @@ ALLOWED_ORIGINS = [
 ]
 
 KNOWLEDGE_DIR = Path(r"D:\KnowledgeBase")   # 知识库目录（模块一生成的 Markdown）
+TRASH_DIR = KNOWLEDGE_DIR / ".trash"         # 删除的卡片先移到回收站，不立即永久删除
 FRONTEND_DIST = Path(
     os.environ.get("KB_FRONTEND_DIST", r"C:\dev\notice-to-calendar\dist")
 )  # Vue 构建产物；可用 KB_FRONTEND_DIST 覆盖
@@ -514,6 +516,34 @@ def set_category(req: CategoryRequest) -> KnowledgeItem:
     _write_post(path, post)
     _, item = load_item(path)
     return item
+
+
+@app.delete("/api/knowledge/{filename:path}", summary="删除知识卡片（移到 .trash）")
+def delete_knowledge(filename: str) -> dict[str, Any]:
+    path = _knowledge_path(filename)
+    if path.parent != KNOWLEDGE_DIR.resolve():
+        raise HTTPException(status_code=400, detail="只能删除知识库根目录下的卡片")
+
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = TRASH_DIR / f"{stamp}-{path.name}"
+    index = 2
+    while target.exists():
+        target = TRASH_DIR / f"{stamp}-{index}-{path.name}"
+        index += 1
+
+    try:
+        shutil.move(str(path), str(target))
+    except OSError as exc:
+        logger.exception("移动到回收站失败：%s", path.name)
+        raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
+
+    return {
+        "ok": True,
+        "filename": path.name,
+        "trash": str(target),
+        "message": "已移到 .trash，未永久删除",
+    }
 
 
 @app.post("/api/knowledge/link", response_model=KnowledgeItem, summary="把链接存成知识卡片")
