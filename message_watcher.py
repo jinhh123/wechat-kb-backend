@@ -279,9 +279,14 @@ class MessageWatcher:
 
         image = rc.capture_window(hwnd)
         chat_name = current_chat_name(image)
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if chat_name != EXPECTED_CHAT:
             log(f"当前聊天是 {chat_name!r}，跳过普通消息采集")
-            status_bus.write_status(current_chat=chat_name or "未识别")
+            status_bus.write_status(
+                current_chat=chat_name or "未识别",
+                last_message_scan_at=now_text,
+                last_message_result="非锦会话，跳过",
+            )
             return 0
 
         lines = _candidate_lines(image)
@@ -296,7 +301,11 @@ class MessageWatcher:
             save_seen(self.seen)
             self._learned = True
             log(f"首次运行：学习当前可见消息 {len(self.seen)} 条，不归档")
-            status_bus.write_status(current_chat=chat_name, last_message_result="已学习当前消息")
+            status_bus.write_status(
+                current_chat=chat_name,
+                last_message_scan_at=now_text,
+                last_message_result="已学习当前消息",
+            )
             return 0
 
         new_lines: list[str] = []
@@ -325,6 +334,11 @@ class MessageWatcher:
                 image_path = str(path)
 
         if not new_lines and image_path is None:
+            status_bus.write_status(
+                current_chat=chat_name,
+                last_message_scan_at=now_text,
+                last_message_result="无新增",
+            )
             return 0
 
         for line in new_lines:
