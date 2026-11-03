@@ -27,6 +27,7 @@ CLI 自测：
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import logging
@@ -44,6 +45,8 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+from privacy import contains_blacklisted
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -144,7 +147,7 @@ def setup_logging() -> None:
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
-            LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
         handler.setFormatter(formatter)
         LOG.addHandler(handler)
@@ -409,11 +412,21 @@ class Pipeline:
         self._futures: set[Future] = set()
         self._closed = False
         self.accepted = 0
+        self._processed_count = 0
 
     # ------------------------------------------------------------------ 提交
     def submit(self, item: IngestItem) -> bool:
         text = normalize_text(item.text)
         if not text:
+            return False
+
+        # 隐私黑名单：任何通道命中都整条丢弃，不进 AI、不落盘
+        if contains_blacklisted(text):
+            LOG.warning(
+                "命中隐私黑名单，整条丢弃（通道=%s，来源=%s）",
+                item.channel,
+                item.source,
+            )
             return False
 
         fingerprint = item.dedup_key or content_fingerprint(
@@ -539,6 +552,11 @@ class Pipeline:
         finally:
             for _t, fp in batch.parts:
                 self._inflight.discard(fp)
+
+            # 长跑进程防内存膨胀：每 10 条任务强制回收一次
+            self._processed_count += 1
+            if self._processed_count % 10 == 0:
+                gc.collect()
 
     def _process_inner(self, batch: _Batch, text: str) -> None:
         result = classify_message(text)

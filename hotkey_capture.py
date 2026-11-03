@@ -34,6 +34,8 @@ import win32con
 from PIL import Image, ImageGrab
 
 import ingest
+from clipboard_guard import ClipboardGuard
+from privacy import contains_blacklisted
 
 SOURCE = "锦"
 HOTKEY_ID = 0xB001
@@ -61,7 +63,7 @@ def setup_logging() -> None:
         ingest.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
             ingest.OUTPUT_DIR / "hotkey_capture.log",
-            maxBytes=5 * 1024 * 1024,
+            maxBytes=10 * 1024 * 1024,
             backupCount=3,
             encoding="utf-8",
         )
@@ -128,36 +130,38 @@ def save_clipboard_image(image, dry_run: bool) -> str | None:
 # 处理
 # =============================================================================
 def handle_clipboard(pipeline: ingest.Pipeline, dry_run: bool) -> bool:
-    text = read_clipboard_text().strip()
-    image = grab_clipboard_image()
+    # 抓取结束后把用户原本的文字/图片原样写回剪贴板
+    with ClipboardGuard():
+        text = read_clipboard_text().strip()
+        image = grab_clipboard_image()
 
-    attachments: list[str] = []
-    if image is not None:
-        saved = save_clipboard_image(image, dry_run)
-        if saved:
-            attachments.append(saved)
+        if contains_blacklisted(text):
+            LOG.warning("命中隐私黑名单，整条丢弃（不调用 AI、不落盘）")
+            return False
+
+        attachments: list[str] = []
+        if image is not None:
+            saved = save_clipboard_image(image, dry_run)
+            if saved:
+                attachments.append(saved)
+            if not text:
+                text = "[剪贴板图片]"
+
         if not text:
-            text = "[剪贴板图片]"
+            LOG.warning("剪贴板里没有文字或图片")
+            return False
 
-    if not text:
-        LOG.warning("剪贴板里没有文字或图片")
-        return False
-
-    LOG.info(
-        "捕获剪贴板：%d 字，%d 张图，预览=%r",
-        len(text),
-        len(attachments),
-        text[:60],
-    )
-    return pipeline.submit(
-        ingest.IngestItem(
-            channel="hotkey",
-            source=SOURCE,
-            text=text,
-            attachments=attachments,
-            immediate=True,
+        # 不打印正文，避免敏感内容进日志
+        LOG.info("捕获剪贴板：%d 字，%d 张图", len(text), len(attachments))
+        return pipeline.submit(
+            ingest.IngestItem(
+                channel="hotkey",
+                source=SOURCE,
+                text=text,
+                attachments=attachments,
+                immediate=True,
+            )
         )
-    )
 
 
 # =============================================================================

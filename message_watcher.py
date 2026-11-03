@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import hashlib
 import json
 import re
@@ -29,6 +30,7 @@ import record_capture as rc
 import status_bus
 from chat_watcher import EXPECTED_CHAT, current_chat_name, find_main_window
 from ingest import IngestItem, Pipeline
+from privacy import contains_blacklisted
 
 OUTPUT_DIR = Path(r"D:\KnowledgeBase")
 IMAGES_DIR = OUTPUT_DIR / "images"
@@ -163,6 +165,7 @@ class MessageAggregator:
         self._image: str | None = None
         self._timer: threading.Timer | None = None
         self._submissions: list[float] = []
+        self._total_submissions = 0
         self._closed = False
 
     def add(self, text: str, image: str | None = None) -> None:
@@ -201,6 +204,15 @@ class MessageAggregator:
         if len(text) > MAX_TEXT_LEN:
             text = text[:MAX_TEXT_LEN] + "\n…（已截断）"
 
+        if contains_blacklisted(text):
+            log("命中隐私黑名单，丢弃整条聚合")
+            if image:
+                try:
+                    Path(image).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return
+
         if not is_meaningful(text) and not image:
             log(f"丢弃低价值聚合：{text[:40]!r}")
             return
@@ -227,6 +239,9 @@ class MessageAggregator:
         )
         if ok:
             self._submissions.append(time.time())
+            self._total_submissions += 1
+            if self._total_submissions % 10 == 0:
+                gc.collect()
             status_bus.write_status(
                 last_message_scan_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 last_message_result="已提交聚合",

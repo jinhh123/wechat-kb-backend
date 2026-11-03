@@ -10,6 +10,8 @@ from __future__ import annotations
 import ctypes
 
 import psutil
+import win32api
+import win32con
 import win32gui
 import win32process
 
@@ -62,7 +64,7 @@ def screen_size() -> tuple[int, int]:
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
-def foreground_info() -> tuple[str, str, tuple[int, int, int, int]] | None:
+def foreground_info() -> tuple[int, str, str, tuple[int, int, int, int]] | None:
     hwnd = win32gui.GetForegroundWindow()
     if not hwnd:
         return None
@@ -76,17 +78,40 @@ def foreground_info() -> tuple[str, str, tuple[int, int, int, int]] | None:
         rect = win32gui.GetWindowRect(hwnd)
     except Exception:
         return None
-    return name, title, rect
+    return hwnd, name, title, rect
 
 
-def is_fullscreen(rect: tuple[int, int, int, int]) -> bool:
+def monitor_rect(hwnd: int | None = None) -> tuple[int, int, int, int]:
+    """取窗口所在显示器的工作区/全屏区域；多屏时不再用主屏硬算。"""
+    try:
+        if hwnd:
+            monitor = win32api.MonitorFromWindow(
+                hwnd, win32con.MONITOR_DEFAULTTONEAREST
+            )
+        else:
+            monitor = win32api.MonitorFromWindow(
+                0, win32con.MONITOR_DEFAULTTOPRIMARY
+            )
+        info = win32api.GetMonitorInfo(monitor)
+        left, top, right, bottom = info["Monitor"]
+        return left, top, right, bottom
+    except Exception:
+        width, height = screen_size()
+        return 0, 0, width, height
+
+
+def is_fullscreen(
+    rect: tuple[int, int, int, int], hwnd: int | None = None
+) -> bool:
     left, top, right, bottom = rect
-    width, height = screen_size()
-    if width <= 0 or height <= 0:
+    m_left, m_top, m_right, m_bottom = monitor_rect(hwnd)
+    mon_width = m_right - m_left
+    mon_height = m_bottom - m_top
+    if mon_width <= 0 or mon_height <= 0:
         return False
-    covers_width = (right - left) >= width * 0.95
-    covers_height = (bottom - top) >= height * 0.95
-    starts_at_edge = left <= 0 and top <= 0
+    covers_width = (right - left) >= mon_width * 0.95
+    covers_height = (bottom - top) >= mon_height * 0.95
+    starts_at_edge = left <= m_left + 2 and top <= m_top + 2
     return covers_width and covers_height and starts_at_edge
 
 
@@ -95,7 +120,7 @@ def detect() -> tuple[bool, str]:
     info = foreground_info()
     if info is None:
         return False, ""
-    name, title, rect = info
+    hwnd, name, title, rect = info
 
     if name in GAME_PROCESSES:
         return True, f"游戏进程：{name}"
@@ -103,7 +128,7 @@ def detect() -> tuple[bool, str]:
     if name in SHELL_PROCESSES:
         return False, ""
 
-    if is_fullscreen(rect):
+    if is_fullscreen(rect, hwnd):
         return True, f"全屏应用：{name or 'unknown'}"
 
     return False, ""

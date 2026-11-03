@@ -46,6 +46,10 @@ import win32process
 import win32ui
 from PIL import Image, ImageChops, ImageGrab
 
+from clipboard_guard import ClipboardGuard
+from focus_guard import ForegroundGuard
+from privacy import contains_blacklisted
+
 OUTPUT_DIR = Path(r"D:\KnowledgeBase")
 IMAGES_DIR = OUTPUT_DIR / "images"
 STAGING_ROOT = OUTPUT_DIR / ".staging"
@@ -893,30 +897,29 @@ def capture_via_clipboard(
             )
         )
 
-    original = _read_clipboard_text()
     old_pos = win32api.GetCursorPos()
 
+    # 无论成功失败，退出时都把用户原来的文字/图片写回剪贴板
     try:
-        for click_x, click_y in points:
-            for _attempt in range(2):
-                _write_clipboard_text(_CLIP_SENTINEL)
-                _click_at(click_x, click_y)
-                _press_ctrl(ord("A"))
-                time.sleep(0.3)
-                _press_ctrl(ord("C"))
-                time.sleep(0.7)
+        with ClipboardGuard():
+            for click_x, click_y in points:
+                for _attempt in range(2):
+                    _write_clipboard_text(_CLIP_SENTINEL)
+                    _click_at(click_x, click_y)
+                    _press_ctrl(ord("A"))
+                    time.sleep(0.3)
+                    _press_ctrl(ord("C"))
+                    time.sleep(0.7)
 
-                text = _read_clipboard_text()
-                if text and text != _CLIP_SENTINEL and any(
-                    "\u4e00" <= ch <= "\u9fff" for ch in text
-                ):
-                    return re.sub(r"\n{3,}", "\n\n", text).strip()
-                time.sleep(0.2)
+                    text = _read_clipboard_text()
+                    if text and text != _CLIP_SENTINEL and any(
+                        "\u4e00" <= ch <= "\u9fff" for ch in text
+                    ):
+                        return re.sub(r"\n{3,}", "\n\n", text).strip()
+                    time.sleep(0.2)
     finally:
         win32api.SetCursorPos(old_pos)
 
-    # 失败则把用户原来的剪贴板内容还回去
-    _write_clipboard_text(original)
     return None
 
 
@@ -1145,6 +1148,12 @@ def main(argv: list[str] | None = None) -> int:
         print("没有识别到文字（窗口可能是空白，或 OCR 语言包缺失）。")
         return 3
 
+    # 隐私优先：命中黑名单时连预览都不打印，避免敏感内容进日志
+    if contains_blacklisted(text):
+        print("  命中隐私黑名单，整条丢弃（不调用 AI、不落盘）")
+        cleanup_work_images()
+        return 0
+
     print("\n" + "-" * 70)
     print(text[:1500])
     print("-" * 70)
@@ -1184,4 +1193,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    with ForegroundGuard():
+        sys.exit(main())

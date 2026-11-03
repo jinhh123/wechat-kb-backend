@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import gc
 import logging
 import os
 import subprocess
@@ -49,6 +50,7 @@ from PIL import Image, ImageDraw
 
 import chat_watcher
 import game_guard
+from focus_guard import ForegroundGuard
 import hotkey_capture
 import ingest
 import message_watcher
@@ -97,7 +99,7 @@ def setup_logging() -> None:
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
-            LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
         handler.setFormatter(formatter)
         LOG.addHandler(handler)
@@ -152,6 +154,8 @@ class TrayApp:
     # ------------------------------------------------------------------ 生命周期
     def run(self) -> int:
         setup_logging()
+        # 托盘启动即声明 DPI 感知，保证多屏/150% 缩放下坐标一致
+        chat_watcher.rc.enable_dpi_awareness()
         self.pipeline = ingest.Pipeline(dry_run=self.dry_run)
         self.message_watcher = message_watcher.MessageWatcher(
             self.pipeline, dry_run=self.dry_run
@@ -364,6 +368,7 @@ class TrayApp:
         if self.stop_event.wait(10):
             return
 
+        scans = 0
         while not self.stop_event.is_set():
             if self.paused.is_set():
                 self.stop_event.wait(self.scan_interval)
@@ -388,6 +393,9 @@ class TrayApp:
                 )
             else:
                 self._run_scan(force=False)
+                scans += 1
+                if scans % 10 == 0:
+                    gc.collect()
 
             self.stop_event.wait(self.scan_interval)
 
@@ -469,7 +477,8 @@ class TrayApp:
                 if self.dry_run:
                     argv.append("--dry-run")
                 LOG.info("开始扫描：%s", " ".join(argv))
-                code = chat_watcher.run(chat_watcher.parse_args(argv))
+                with ForegroundGuard():
+                    code = chat_watcher.run(chat_watcher.parse_args(argv))
                 LOG.info("扫描结束，返回 %s", code)
                 status_bus.write_status(
                     scanning=False,

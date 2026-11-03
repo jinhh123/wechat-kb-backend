@@ -45,6 +45,7 @@ import win32process
 from PIL import Image, ImageChops
 
 import record_capture as rc
+from focus_guard import ForegroundGuard, restore_window
 
 OUTPUT_DIR = Path(r"D:\KnowledgeBase")
 SEEN_FILE = OUTPUT_DIR / ".watcher_seen.json"
@@ -75,7 +76,7 @@ def setup_logging() -> None:
         from logging.handlers import RotatingFileHandler
 
         handler = RotatingFileHandler(
-            LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
         handler.setFormatter(formatter)
         LOG.addHandler(handler)
@@ -326,6 +327,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     hwnd, title = main
+    user_foreground = win32gui.GetForegroundWindow()
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(1.0)
@@ -483,6 +485,7 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(0.5)
             close_record_windows()
             time.sleep(0.5)
+            restore_window(user_foreground)
 
     if scrolled:
         _scroll_message(hwnd, -120, 4 * scrolled)
@@ -522,7 +525,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        return run(parse_args(argv))
+        with ForegroundGuard():
+            return run(parse_args(argv))
     except KeyboardInterrupt:
         LOG.info("收到 Ctrl+C")
         return 0
