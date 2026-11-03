@@ -566,7 +566,9 @@ def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
         items.append(item)
 
     already_merged = [
-        item.filename for item in items if item.is_merged or item.merged_into
+        item.filename
+        for item in items
+        if item.is_merged or item.merged_into or item.merged_from
     ]
     if already_merged:
         raise HTTPException(
