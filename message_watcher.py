@@ -92,18 +92,37 @@ def is_meaningful(text: str) -> bool:
     return True
 
 
+def _is_outgoing(image, box: tuple[float, float, float, float]) -> bool:
+    """绿色气泡判定：小号自己发的消息是绿底黑字，大号发来的是白底。"""
+    top, left, right, bottom = box
+    crop = image.crop((int(left), int(top), int(right), int(bottom))).convert("RGB")
+    pixels = list(crop.getdata())
+    if not pixels:
+        return False
+    r = sum(p[0] for p in pixels) / len(pixels)
+    g = sum(p[1] for p in pixels) / len(pixels)
+    b = sum(p[2] for p in pixels) / len(pixels)
+    return g > r * 1.18 and g > b * 1.25
+
+
 def _candidate_lines(image) -> list[str]:
-    """只取聊天区正文的 OCR 行，排除标题/输入框/时间/系统提示。"""
+    """
+    只取聊天区左侧（对方）的正文 OCR 行，排除：
+    标题/输入框/时间/系统提示/右侧绿色气泡（自己发的）。
+    """
     boxes = asyncio.run(rc.ocr_boxes(image))
     top_limit = image.height * 0.12
     bottom_limit = image.height * 0.78
     left_limit = image.width * 0.35
+    incoming_limit = image.width * 0.62
 
     lines: list[str] = []
-    for top, left, _right, _bottom, text in boxes:
+    for top, left, right, bottom, text in boxes:
         if top < top_limit or top > bottom_limit:
             continue
-        if left < left_limit:
+        if left < left_limit or left > incoming_limit:
+            continue
+        if _is_outgoing(image, (top, left, right, bottom)):
             continue
         value = rc.clean_ocr_line(text)
         if len(value) < 2:

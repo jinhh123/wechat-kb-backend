@@ -13,7 +13,6 @@ import sys
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import ttk
 
 import status_bus
 
@@ -40,12 +39,13 @@ class StatusPanel:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("微信知识库采集 · 状态")
-        self.root.geometry("520x620")
-        self.root.minsize(480, 560)
+        self.root.geometry("540x760")
+        self.root.minsize(520, 700)
         self.root.configure(bg=COLOR_BG)
 
         self.topmost_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="读取中…")
+        self.game_var = tk.StringVar(value="🎮 全屏应用：否")
         self.chat_var = tk.StringVar(value="-")
         self.scan_var = tk.StringVar(value="-")
         self.message_var = tk.StringVar(value="-")
@@ -124,7 +124,18 @@ class StatusPanel:
             font=("Microsoft YaHei UI", 20, "bold"),
             anchor="w",
         )
-        self.status_label.pack(fill="x", padx=14, pady=(0, 4))
+        self.status_label.pack(fill="x", padx=14, pady=(0, 2))
+        self.game_label = tk.Label(
+            status_card,
+            textvariable=self.game_var,
+            bg=COLOR_CARD,
+            fg=COLOR_GREEN,
+            font=("Microsoft YaHei UI", 10, "bold"),
+            anchor="w",
+            wraplength=460,
+            justify="left",
+        )
+        self.game_label.pack(fill="x", padx=14, pady=(0, 6))
         self._line(status_card, "当前聊天", self.chat_var)
         self._line(status_card, "上次记录扫描", self.scan_var)
         self._line(status_card, "上次消息扫描", self.message_var)
@@ -137,7 +148,7 @@ class StatusPanel:
         recent_card.pack(fill="both", expand=True, padx=16, pady=6)
         self.recent_text = tk.Text(
             recent_card,
-            height=7,
+            height=5,
             bd=0,
             bg=COLOR_CARD,
             fg=COLOR_TEXT,
@@ -163,19 +174,30 @@ class StatusPanel:
 
         # 控制按钮
         buttons = tk.Frame(self.root, bg=COLOR_BG)
-        buttons.pack(fill="x", padx=16, pady=(4, 8))
+        buttons.pack(side="bottom", fill="x", padx=16, pady=(4, 8))
         for text, command in (
             ("立即扫描", lambda: self._send("scan")),
             ("暂停/恢复", lambda: self._send("toggle_pause")),
             ("打开日志", self._open_log),
             ("知识库目录", self._open_folder),
         ):
-            ttk.Button(buttons, text=text, command=command).pack(
-                side="left", padx=(0, 6)
-            )
+            tk.Button(
+                buttons,
+                text=text,
+                command=command,
+                bg=COLOR_CARD,
+                fg=COLOR_TEXT,
+                activebackground="#eef2f7",
+                activeforeground=COLOR_TEXT,
+                relief="solid",
+                bd=1,
+                padx=10,
+                pady=4,
+                font=("Microsoft YaHei UI", 9),
+            ).pack(side="left", padx=(0, 6))
 
         bottom = tk.Frame(self.root, bg=COLOR_BG)
-        bottom.pack(fill="x", padx=16, pady=(0, 14))
+        bottom.pack(side="bottom", fill="x", padx=16, pady=(0, 14))
         tk.Checkbutton(
             bottom,
             text="窗口置顶",
@@ -187,7 +209,19 @@ class StatusPanel:
             font=("Microsoft YaHei UI", 9),
             selectcolor=COLOR_CARD,
         ).pack(side="left")
-        ttk.Button(bottom, text="刷新", command=self.refresh).pack(side="right")
+        tk.Button(
+            bottom,
+            text="刷新",
+            command=self.refresh,
+            bg=COLOR_CARD,
+            fg=COLOR_TEXT,
+            activebackground="#eef2f7",
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=3,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="right")
 
     # ------------------------------------------------------------------ 行为
     def _toggle_topmost(self) -> None:
@@ -221,6 +255,8 @@ class StatusPanel:
         if not data:
             self.status_var.set("未连接")
             self.status_label.configure(fg=COLOR_ORANGE)
+            self.game_var.set("🎮 全屏应用：未知")
+            self.game_label.configure(fg=COLOR_MUTED)
             self.chat_var.set("托盘未运行")
             self.updated_var.set("-")
             return
@@ -236,6 +272,16 @@ class StatusPanel:
         else:
             self.status_var.set("运行中")
             self.status_label.configure(fg=COLOR_GREEN)
+
+        if data.get("game_mode"):
+            self.game_var.set(
+                f"🎮 当前处于全屏应用，自动化已挂起："
+                f"{_fmt(data.get('game_reason'), '全屏应用')}"
+            )
+            self.game_label.configure(fg=COLOR_ORANGE)
+        else:
+            self.game_var.set("🎮 全屏应用：否")
+            self.game_label.configure(fg=COLOR_GREEN)
 
         self.chat_var.set(_fmt(data.get("current_chat"), "未识别"))
         self.scan_var.set(_fmt(data.get("last_scan_at"), "尚未扫描"))

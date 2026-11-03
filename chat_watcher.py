@@ -329,7 +329,10 @@ def run(args: argparse.Namespace) -> int:
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(1.0)
-    win32gui.SetForegroundWindow(hwnd)
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception as exc:
+        LOG.warning("微信主窗口置前失败（不影响后台截图）：%s", exc)
     time.sleep(0.5)
 
     image, cards = scan_cards(hwnd)

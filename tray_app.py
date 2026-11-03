@@ -48,6 +48,7 @@ import winerror
 from PIL import Image, ImageDraw
 
 import chat_watcher
+import game_guard
 import hotkey_capture
 import ingest
 import message_watcher
@@ -144,6 +145,8 @@ class TrayApp:
         self.icon: pystray.Icon | None = None
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
+        self.game_mode = False
+        self.game_reason = ""
         self._closed = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -158,10 +161,13 @@ class TrayApp:
             running=True,
             paused=False,
             scanning=False,
+            game_mode=False,
+            game_reason="",
             current_chat="待识别",
             hotkeys="Ctrl+Alt+K / Ctrl+Alt+S",
             last_error="",
             today_archived=self._today_count(),
+            recent_files=self._recent_files(),
         )
 
         self.hotkey_thread = threading.Thread(
@@ -170,6 +176,12 @@ class TrayApp:
         self.hotkey_thread.start()
 
         threading.Thread(target=self._scan_loop, name="scanner", daemon=True).start()
+        threading.Thread(
+            target=self._message_loop, name="messages", daemon=True
+        ).start()
+        threading.Thread(
+            target=self._game_loop, name="game-guard", daemon=True
+        ).start()
         threading.Thread(
             target=self._command_loop, name="commands", daemon=True
         ).start()
@@ -269,6 +281,21 @@ class TrayApp:
         self._trigger_scan()
 
     def _open_panel(self, icon: pystray.Icon, item: Any) -> None:
+        # 已经开着就拉到前台，避免重复开窗
+        existing: list[int] = []
+
+        def callback(hwnd: int, _extra) -> None:
+            if win32gui.IsWindowVisible(hwnd) and "微信知识库采集" in win32gui.GetWindowText(hwnd):
+                existing.append(hwnd)
+
+        win32gui.EnumWindows(callback, None)
+        if existing:
+            try:
+                win32gui.SetForegroundWindow(existing[0])
+            except Exception:
+                pass
+            return
+
         panel = Path(__file__).with_name("status_panel.py")
         try:
             subprocess.Popen(
@@ -342,6 +369,14 @@ class TrayApp:
                 self.stop_event.wait(self.scan_interval)
                 continue
 
+            if self.game_mode:
+                LOG.info(
+                    "全屏/游戏模式（%s），自动记录扫描挂起",
+                    self.game_reason or "全屏应用",
+                )
+                self.stop_event.wait(self.scan_interval)
+                continue
+
             idle = chat_watcher.idle_seconds()
             if idle < BUSY_WINDOW_SECONDS:
                 LOG.info("用户正在操作（空闲 %.1f 秒），跳过本轮", idle)
@@ -355,6 +390,61 @@ class TrayApp:
                 self._run_scan(force=False)
 
             self.stop_event.wait(self.scan_interval)
+
+    def _game_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                mode, reason = game_guard.detect()
+            except Exception:
+                LOG.exception("全屏检测失败")
+                mode, reason = False, ""
+
+            if mode != self.game_mode or reason != self.game_reason:
+                self.game_mode = mode
+                self.game_reason = reason
+                if mode:
+                    LOG.warning("检测到全屏/游戏模式：%s，自动化已挂起", reason)
+                else:
+                    LOG.info("已退出全屏/游戏模式，自动化恢复")
+                status_bus.write_status(
+                    game_mode=mode,
+                    game_reason=reason,
+                )
+
+            self.stop_event.wait(10.0)
+
+    def _message_loop(self) -> None:
+        """轻量消息轮询：每 15 秒只做 OCR，不点击、不抢焦点。"""
+        if self.stop_event.wait(15):
+            return
+
+        while not self.stop_event.is_set():
+            if self.paused.is_set() or self.game_mode:
+                self.stop_event.wait(15)
+                continue
+
+            # 二次确认，避免游戏在 10 秒窗口内刚启动
+            try:
+                mode, reason = game_guard.detect()
+            except Exception:
+                mode, reason = False, ""
+            if mode:
+                if not self.game_mode:
+                    self.game_mode = True
+                    self.game_reason = reason
+                    status_bus.write_status(game_mode=True, game_reason=reason)
+                self.stop_event.wait(15)
+                continue
+
+            try:
+                with self.ui_lock:
+                    if self.message_watcher is not None:
+                        self.message_watcher.scan_once()
+            except Exception:
+                LOG.exception("轻量消息轮询失败")
+                status_bus.write_status(last_error="轻量消息轮询失败")
+
+            self.stop_event.wait(15)
 
     def _run_scan(
         self, force: bool, all_cards: bool = False, scroll: bool = False
@@ -380,11 +470,6 @@ class TrayApp:
                     argv.append("--dry-run")
                 LOG.info("开始扫描：%s", " ".join(argv))
                 code = chat_watcher.run(chat_watcher.parse_args(argv))
-
-                # 记录卡片处理完后，再扫一遍普通单条消息（15 秒聚合在 watcher 内）
-                if self.message_watcher is not None:
-                    self.message_watcher.scan_once()
-
                 LOG.info("扫描结束，返回 %s", code)
                 status_bus.write_status(
                     scanning=False,
