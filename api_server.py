@@ -102,6 +102,8 @@ class KnowledgeItem(BaseModel):
     date: str            # YYYY-MM-DD HH:MM:SS
     tags: list[str]
     content: str
+    category: str = "未分类"
+    is_merged: bool = False
 
 
 class ControlCommand(BaseModel):
@@ -113,6 +115,17 @@ class MergeRequest(BaseModel):
     title: str = ""
     type: str = "knowledge"
     tags: list[str] = []
+    category: str = ""
+
+
+class CategoryRequest(BaseModel):
+    filename: str
+    category: str
+
+
+class LinkRequest(BaseModel):
+    url: str
+    title: str = ""
 
 
 # =============================================================================
@@ -258,6 +271,8 @@ def load_item(path: Path) -> tuple[datetime, KnowledgeItem]:
         date=date_text,
         tags=normalize_tags(meta.get("tags")),
         content=content,
+        category=as_text(meta.get("category"), "未分类"),
+        is_merged=bool(meta.get("is_merged", False)),
     )
     return sort_dt, item
 
@@ -417,27 +432,81 @@ def control(cmd: ControlCommand) -> dict[str, Any]:
     return {"ok": True, "command": command}
 
 
+def _knowledge_path(filename: str) -> Path:
+    path = (KNOWLEDGE_DIR / filename).resolve()
+    try:
+        path.relative_to(KNOWLEDGE_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"非法文件名：{filename}")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在：{filename}")
+    return path
+
+
+def _write_post(path: Path, post: frontmatter.Post) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8", newline="\n")
+    os.replace(tmp, path)
+
+
+@app.post("/api/knowledge/category", response_model=KnowledgeItem, summary="把分类写回 Markdown")
+def set_category(req: CategoryRequest) -> KnowledgeItem:
+    path = _knowledge_path(req.filename)
+    category = (req.category or "").strip() or "未分类"
+    post = frontmatter.loads(read_markdown(path))
+    post["category"] = category
+    _write_post(path, post)
+    _, item = load_item(path)
+    return item
+
+
+@app.post("/api/knowledge/link", response_model=KnowledgeItem, summary="把链接存成知识卡片")
+def add_link(req: LinkRequest) -> KnowledgeItem:
+    url = (req.url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        raise HTTPException(status_code=400, detail="只支持 http/https 链接")
+    title = (req.title or "").strip() or url
+    body = f"[{title}]({url})\n\n{url}"
+    now = datetime.now()
+    post = frontmatter.Post(
+        body,
+        type="knowledge",
+        title=title,
+        source="链接",
+        date=now.strftime("%Y-%m-%d %H:%M:%S"),
+        tags=["链接"],
+        category="未分类",
+    )
+
+    safe_title = re.sub(r'[\\/:*?"<>|]+', "-", title).strip() or "链接"
+    stem = f"{now:%Y-%m-%d}-{safe_title[:60]}"
+    target = KNOWLEDGE_DIR / f"{stem}.md"
+    index = 2
+    while target.exists():
+        target = KNOWLEDGE_DIR / f"{stem}-{index}.md"
+        index += 1
+    _write_post(target, post)
+    _, created = load_item(target)
+    return created
+
+
 @app.post("/api/knowledge/merge", response_model=KnowledgeItem, summary="合并多张知识卡片")
 def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
     if len(req.filenames) < 2:
         raise HTTPException(status_code=400, detail="至少选择两张卡片")
 
-    root = KNOWLEDGE_DIR.resolve()
     items: list[KnowledgeItem] = []
+    paths: list[Path] = []
     for name in req.filenames:
-        path = (KNOWLEDGE_DIR / name).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"非法文件名：{name}")
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail=f"文件不存在：{name}")
+        path = _knowledge_path(name)
         _, item = load_item(path)
+        paths.append(path)
         items.append(item)
 
     title = (req.title or "").strip() or f"合并知识-{datetime.now():%Y%m%d-%H%M}"
     doc_type = req.type if req.type in {"schedule", "knowledge"} else "knowledge"
     tags = list(dict.fromkeys([*req.tags, "合并"]))
+    category = (req.category or "").strip() or "未分类"
 
     body_parts = []
     for item in items:
@@ -451,6 +520,7 @@ def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
         source="合并",
         date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         tags=tags,
+        category=category,
         merged_from=[item.filename for item in items],
     )
 
@@ -462,7 +532,17 @@ def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
         target = KNOWLEDGE_DIR / f"{stem}-{index}.md"
         index += 1
 
-    target.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8", newline="\n")
+    _write_post(target, post)
+
+    # 原卡片保留，但打上 is_merged 标记
+    for path in paths:
+        try:
+            original = frontmatter.loads(read_markdown(path))
+            original["is_merged"] = True
+            _write_post(path, original)
+        except Exception:
+            logger.exception("标记 is_merged 失败：%s", path.name)
+
     _, created = load_item(target)
     return created
 

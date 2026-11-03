@@ -28,6 +28,7 @@ from pathlib import Path
 import status_bus
 
 ROOT = Path(__file__).resolve().parent
+PYTHON = ROOT / "venv" / "Scripts" / "python.exe"
 PYTHONW = ROOT / "venv" / "Scripts" / "pythonw.exe"
 FRONTEND_DIR = Path(
     os.environ.get("KB_FRONTEND_DIR", r"C:\dev\notice-to-calendar")
@@ -85,6 +86,7 @@ def _spawn(args: list[str], cwd: Path) -> None:
         cwd=str(cwd),
         creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
         close_fds=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -116,8 +118,10 @@ def _read_status() -> dict:
 def ensure_api() -> str:
     if _api_online():
         return "API 已在运行"
-    _spawn([str(PYTHONW), str(ROOT / "api_server.py")], ROOT)
-    if _wait(_api_online, timeout=12):
+    # 用 python.exe + CREATE_NO_WINDOW，避免 pythonw 下 stdout 为 None 时
+    # uvicorn 偶发启动失败；输出统一丢到 DEVNULL。
+    _spawn([str(PYTHON), str(ROOT / "api_server.py")], ROOT)
+    if _wait(_api_online, timeout=15):
         return "API 已启动"
     return "API 启动失败，请查看 api_server 日志"
 

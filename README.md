@@ -148,7 +148,9 @@ API 新增：
 - `POST /api/control`（`scan` / `toggle_pause` / `open_panel`）
 - `POST /api/open/log`
 - `POST /api/open/folder`
-- `POST /api/knowledge/merge`（合并多张卡片）
+- `POST /api/knowledge/merge`（合并多张卡片，原卡片写入 `is_merged: true`）
+- `POST /api/knowledge/category`（分类写回 YAML frontmatter）
+- `POST /api/knowledge/link`（把链接存成卡片）
 - `GET /images/*`（知识库图片）
 
 ### 知识卡片交互
@@ -156,9 +158,11 @@ API 新增：
 - 点击卡片打开详情弹窗，不再在卡片内展开；
 - 正文用 Markdown 渲染，`![图片](./images/...)` 直接显示为图片，点击可放大；
 - 支持搜索、类型筛选、星标；
-- 多选后可合并成一张新卡片（原卡片保留）；
-- 卡片可拖拽到分类上归类（分类保存在浏览器 localStorage）；
-- 公众号/小程序卡片：复制链接后用 `Ctrl+Alt+K` 归档，链接在卡片里可点击；小程序卡片可保留截图/图片，但不能在没有数据库/Hook 的前提下结构化提取内容；
+- 多选后可合并成一张新卡片；原卡片保留，但 frontmatter 会标记 `is_merged: true`；
+- 卡片可拖拽到分类上归类，分类会调用后端写入该 Markdown 的 `category` 字段，localStorage 只做缓存；
+- 详情弹窗支持“添加到日程”，会把卡片标题和日期写入前端日历；
+- 右上角“粘贴链接”可直接把公众号文章链接存成知识卡片；
+- 公众号/小程序卡片：复制链接后用 `Ctrl+Alt+K` 或“粘贴链接”归档，链接在卡片里可点击；小程序卡片可保留截图/图片，但不能在没有数据库/Hook 的前提下结构化提取内容；
 - 微信没有公开的原文深链，“复制定位信息”会复制标题和日期，需要到微信里手动搜索。
 
 ---
