@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ctypes
-import hashlib
 import json
 import logging
 import sys
@@ -42,6 +41,7 @@ import win32api
 import win32con
 import win32gui
 import win32process
+from PIL import Image, ImageChops
 
 import record_capture as rc
 
@@ -141,14 +141,45 @@ def save_seen(path: Path, seen: set[str]) -> None:
 
 
 def card_signature(image, box: tuple[float, float, float, float, str]) -> str:
+    """
+    卡片感知哈希（dHash）。
+
+    滚动后 Qt 的亚像素渲染会让精确 SHA 变化，改用 8x8 相邻像素比较，
+    再用海明距离判断“是不是同一张卡”，避免滚动一次就重新打开旧卡片。
+    """
     top, left, right, _bottom, _text = box
     crop_left = max(0, int(left) - 10)
     crop_top = max(0, int(top) - 10)
     crop_right = min(image.width, int(right) + 260)
     crop_bottom = min(image.height, int(top) + 160)
     crop = image.crop((crop_left, crop_top, crop_right, crop_bottom))
-    gray = crop.convert("L").resize((32, 32))
-    return hashlib.sha256(gray.tobytes()).hexdigest()
+    gray = crop.convert("L").resize((9, 8), Image.LANCZOS)
+    pixels = list(gray.tobytes())
+
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            left_pixel = pixels[row * 9 + col]
+            right_pixel = pixels[row * 9 + col + 1]
+            bits = (bits << 1) | (1 if left_pixel > right_pixel else 0)
+    return f"{bits:016x}"
+
+
+def hamming_distance(a: str, b: str) -> int:
+    try:
+        return bin(int(a, 16) ^ int(b, 16)).count("1")
+    except ValueError:
+        return 999
+
+
+def is_signature_seen(signature: str, seen: set[str]) -> bool:
+    if signature in seen:
+        return True
+    # 只和同长度的 dHash 比较；旧版 64 位 SHA 自动忽略
+    return any(
+        len(item) == 16 and hamming_distance(signature, item) <= 6
+        for item in seen
+    )
 
 
 @dataclass
@@ -157,8 +188,7 @@ class Card:
     signature: str
 
 
-def scan_cards(hwnd: int) -> tuple[Any, list[Card]]:
-    image = rc.capture_window(hwnd)
+def scan_cards_from_image(image) -> list[Card]:
     boxes = asyncio.run(rc.ocr_boxes(image))
     cards: list[Card] = []
 
@@ -171,7 +201,36 @@ def scan_cards(hwnd: int) -> tuple[Any, list[Card]]:
         cards.append(Card(box=box, signature=card_signature(image, box)))
 
     cards.sort(key=lambda c: c.box[0])
-    return image, cards
+    return cards
+
+
+def scan_cards(hwnd: int) -> tuple[Any, list[Card]]:
+    image = rc.capture_window(hwnd)
+    return image, scan_cards_from_image(image)
+
+
+def _scroll_message(hwnd: int, delta: int, notches: int) -> None:
+    """向聊天区发送滚轮消息：不移动鼠标、不抢焦点。"""
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    x = left + int((right - left) * 0.72)
+    y = top + int((bottom - top) * 0.55)
+    lparam = win32api.MAKELONG(x, y)
+    wparam = (delta << 16) & 0xFFFFFFFF
+    for _ in range(notches):
+        win32gui.PostMessage(hwnd, win32con.WM_MOUSEWHEEL, wparam, lparam)
+        time.sleep(0.08)
+
+
+def scroll_up_once(hwnd: int, before: Image.Image, notches: int = 4) -> tuple[Image.Image, bool]:
+    """向上滚一屏，返回 (截图, 画面是否变化)。变化太小视为已到顶。"""
+    _scroll_message(hwnd, 120, notches)
+    time.sleep(1.0)
+    after = rc.capture_window(hwnd)
+
+    diff = ImageChops.difference(before.convert("L"), after.convert("L"))
+    data = diff.tobytes()
+    mean = sum(data) / max(1, len(data))
+    return after, mean > 0.5
 
 
 def double_click_card(hwnd: int, image, box: tuple[float, float, float, float, str]) -> None:
@@ -234,13 +293,17 @@ def run(args: argparse.Namespace) -> int:
     image, cards = scan_cards(hwnd)
     LOG.info("当前窗口：%r，检测到 %d 张聊天记录卡片", title, len(cards))
 
-    if not cards:
+    if not cards and not args.scroll_history:
         LOG.warning("没有检测到「群聊的聊天记录」；请先打开「锦」的聊天窗口")
         return 0
 
     seen = load_seen(Path(args.seen_file) if args.seen_file else SEEN_FILE)
     # --all：本轮遍历当前可见的全部卡片（忽略历史签名，靠 ingest 内容 hash 防重复）
-    new_cards = cards if args.all else [card for card in cards if card.signature not in seen]
+    new_cards = (
+        cards
+        if args.all
+        else [card for card in cards if not is_signature_seen(card.signature, seen)]
+    )
 
     if args.scan or not args.process:
         for index, card in enumerate(cards, start=1):
@@ -256,7 +319,7 @@ def run(args: argparse.Namespace) -> int:
         LOG.info("新模式：--process 才会双击抓取")
         return 0
 
-    if not new_cards:
+    if not new_cards and not args.scroll_history:
         LOG.info("没有新卡片")
         return 0
 
@@ -270,9 +333,25 @@ def run(args: argparse.Namespace) -> int:
     attempts = 0
     processed_signatures: set[str] = set()
     processed_tops: list[float] = []
+    scroll_pages = 0
+    empty_scrolls = 0
+    scrolled = 0
+
+    def pick_pending(cards: list[Card]) -> list[Card]:
+        result: list[Card] = []
+        for card in cards:
+            if card.signature in processed_signatures:
+                continue
+            # 顶部坐标太接近，说明是同一张卡（已读后红点消失会导致签名变化）
+            if any(abs(card.box[0] - top) <= 40 for top in processed_tops):
+                continue
+            if not args.all and is_signature_seen(card.signature, seen):
+                continue
+            result.append(card)
+        return result
 
     # 每处理一张都重新聚焦 + 重新扫描，避免复用上一张的坐标
-    while attempts < 50:
+    while attempts < 200:
         attempts += 1
         try:
             win32gui.SetForegroundWindow(hwnd)
@@ -281,19 +360,34 @@ def run(args: argparse.Namespace) -> int:
         time.sleep(0.4)
 
         image, cards = scan_cards(hwnd)
-        pending = []
-        for card in cards:
-            if card.signature in processed_signatures:
-                continue
-            # 顶部坐标太接近，说明是同一张卡（已读后红点消失会导致签名变化）
-            if any(abs(card.box[0] - top) <= 40 for top in processed_tops):
-                continue
-            if not args.all and card.signature in seen:
-                continue
-            pending.append(card)
+        pending = pick_pending(cards)
 
         if not pending:
-            break
+            if not args.scroll_history or scroll_pages >= args.max_scroll_pages:
+                break
+
+            before = rc.capture_window(hwnd)
+            after, changed = scroll_up_once(hwnd, before)
+            scrolled += 1
+            scroll_pages += 1
+            if not changed:
+                LOG.info("第 %d 次向上滚动画面无变化，可能已到顶", scroll_pages)
+                break
+
+            LOG.info("向上滚动第 %d 屏，继续查找历史卡片", scroll_pages)
+            processed_tops.clear()
+            cards = scan_cards_from_image(after)
+            pending = pick_pending(cards)
+
+            if not pending:
+                empty_scrolls += 1
+                if empty_scrolls >= 2:
+                    LOG.info("连续 2 屏没有新卡片，停止上翻")
+                    break
+                continue
+
+            empty_scrolls = 0
+            continue
 
         card = pending[0]
         processed_signatures.add(card.signature)
@@ -322,6 +416,11 @@ def run(args: argparse.Namespace) -> int:
             close_record_windows()
             time.sleep(0.5)
 
+    if scrolled:
+        _scroll_message(hwnd, -120, 4 * scrolled)
+        time.sleep(0.8)
+        LOG.info("已向下滚回 %d 屏", scrolled)
+
     save_seen(Path(args.seen_file) if args.seen_file else SEEN_FILE, seen)
     LOG.info("本轮完成：处理 %d 张，累计签名 %d 个", processed, len(seen))
     return 0
@@ -337,6 +436,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--all", action="store_true", help="遍历当前可见的全部卡片（忽略已处理签名）"
     )
     parser.add_argument("--force", action="store_true", help="忽略空闲阈值")
+    parser.add_argument(
+        "--scroll-history",
+        action="store_true",
+        help="处理完当前屏后向上滚动，继续抓历史卡片（仅处理未见过的）",
+    )
+    parser.add_argument(
+        "--max-scroll-pages", type=int, default=10, help="最多向上滚几屏"
+    )
     parser.add_argument(
         "--threshold", type=int, default=IDLE_THRESHOLD_SECONDS, help="空闲秒数阈值"
     )

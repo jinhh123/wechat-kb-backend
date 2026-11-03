@@ -123,10 +123,13 @@ def capture_image_original(hwnd: int, box: tuple[int, int, int, int]) -> str | N
 # =============================================================================
 class TrayApp:
     def __init__(self, dry_run: bool = False, idle_threshold: int = DEFAULT_IDLE_THRESHOLD,
-                 scan_interval: int = DEFAULT_SCAN_INTERVAL) -> None:
+                 scan_interval: int = DEFAULT_SCAN_INTERVAL,
+                 scroll_history: bool = False, scroll_pages: int = 5) -> None:
         self.dry_run = dry_run
         self.idle_threshold = idle_threshold
         self.scan_interval = scan_interval
+        self.scroll_history = scroll_history
+        self.scroll_pages = scroll_pages
 
         self.paused = threading.Event()
         self.stop_event = threading.Event()
@@ -157,10 +160,12 @@ class TrayApp:
             self._menu(),
         )
         LOG.info(
-            "托盘已启动：空闲阈值 %d 秒，扫描间隔 %d 秒，dry_run=%s",
+            "托盘已启动：空闲阈值 %d 秒，扫描间隔 %d 秒，dry_run=%s，scroll_history=%s(%d 屏)",
             self.idle_threshold,
             self.scan_interval,
             self.dry_run,
+            self.scroll_history,
+            self.scroll_pages,
         )
         self.icon.run()
         self._shutdown()
@@ -217,7 +222,11 @@ class TrayApp:
         LOG.info("手动触发扫描：遍历当前可见的全部卡片")
         threading.Thread(
             target=self._run_scan,
-            kwargs={"force": True, "all_cards": True},
+            kwargs={
+                "force": True,
+                "all_cards": True,
+                "scroll": self.scroll_history,
+            },
             name="scan-now",
             daemon=True,
         ).start()
@@ -262,7 +271,9 @@ class TrayApp:
 
             self.stop_event.wait(self.scan_interval)
 
-    def _run_scan(self, force: bool, all_cards: bool = False) -> None:
+    def _run_scan(
+        self, force: bool, all_cards: bool = False, scroll: bool = False
+    ) -> None:
         if self.stop_event.is_set():
             return
         if not self.scan_lock.acquire(blocking=False):
@@ -276,6 +287,10 @@ class TrayApp:
                     argv.append("--force")
                 if all_cards:
                     argv.append("--all")
+                if scroll:
+                    argv.extend(
+                        ["--scroll-history", "--max-scroll-pages", str(self.scroll_pages)]
+                    )
                 if self.dry_run:
                     argv.append("--dry-run")
                 LOG.info("开始扫描：%s", " ".join(argv))
@@ -339,7 +354,11 @@ class TrayApp:
         LOG.info("收到 Ctrl+Alt+S：强制扫描全部可见卡片（忽略空闲）")
         threading.Thread(
             target=self._run_scan,
-            kwargs={"force": True, "all_cards": True},
+            kwargs={
+                "force": True,
+                "all_cards": True,
+                "scroll": self.scroll_history,
+            },
             name="scan-hotkey",
             daemon=True,
         ).start()
@@ -369,6 +388,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--scan-interval", type=int, default=DEFAULT_SCAN_INTERVAL,
         help="两次自动扫描间隔秒数（默认 60）",
     )
+    parser.add_argument(
+        "--scroll-history",
+        action="store_true",
+        help="手动扫描时向上翻页抓历史卡片（默认关闭）",
+    )
+    parser.add_argument(
+        "--scroll-pages", type=int, default=5, help="手动扫描最多向上翻几屏"
+    )
     return parser.parse_args(argv)
 
 
@@ -397,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         idle_threshold=args.idle_threshold,
         scan_interval=args.scan_interval,
+        scroll_history=args.scroll_history,
+        scroll_pages=args.scroll_pages,
     )
     return app.run()
 

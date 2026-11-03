@@ -22,5 +22,5 @@ if not exist "%ROOT%tray_app.py" (
     exit /b 1
 )
 
-start "" "%ROOT%venv\Scripts\pythonw.exe" "%ROOT%tray_app.py" %*
+start "" "%ROOT%venv\Scripts\pythonw.exe" "%ROOT%tray_app.py" --scroll-history --scroll-pages 5 %*
 exit /b 0

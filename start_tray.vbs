@@ -7,4 +7,4 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 
 root = fso.GetParentFolderName(WScript.ScriptFullName)
 shell.CurrentDirectory = root
-shell.Run """" & root & "\venv\Scripts\pythonw.exe"" """ & root & "\tray_app.py""", 0, False
+shell.Run """" & root & "\venv\Scripts\pythonw.exe"" """ & root & "\tray_app.py"" --scroll-history --scroll-pages 5", 0, False
