@@ -31,10 +31,12 @@ import argparse
 import ctypes
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
 from ctypes import wintypes
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,8 @@ from PIL import Image, ImageDraw
 import chat_watcher
 import hotkey_capture
 import ingest
+import message_watcher
+import status_bus
 
 OUTPUT_DIR = ingest.OUTPUT_DIR
 LOG_PATH = OUTPUT_DIR / "tray_app.log"
@@ -136,6 +140,7 @@ class TrayApp:
         self.ui_lock = threading.Lock()      # 扫描与热键互斥，避免剪贴板冲突
         self.scan_lock = threading.Lock()    # 防止重复扫描
         self.pipeline: ingest.Pipeline | None = None
+        self.message_watcher: message_watcher.MessageWatcher | None = None
         self.icon: pystray.Icon | None = None
         self.hotkey_thread: threading.Thread | None = None
         self.hotkey_thread_id: int | None = None
@@ -145,6 +150,19 @@ class TrayApp:
     def run(self) -> int:
         setup_logging()
         self.pipeline = ingest.Pipeline(dry_run=self.dry_run)
+        self.message_watcher = message_watcher.MessageWatcher(
+            self.pipeline, dry_run=self.dry_run
+        )
+
+        status_bus.write_status(
+            running=True,
+            paused=False,
+            scanning=False,
+            current_chat="待识别",
+            hotkeys="Ctrl+Alt+K / Ctrl+Alt+S",
+            last_error="",
+            today_archived=self._today_count(),
+        )
 
         self.hotkey_thread = threading.Thread(
             target=self._hotkey_loop, name="hotkey", daemon=True
@@ -152,6 +170,9 @@ class TrayApp:
         self.hotkey_thread.start()
 
         threading.Thread(target=self._scan_loop, name="scanner", daemon=True).start()
+        threading.Thread(
+            target=self._command_loop, name="commands", daemon=True
+        ).start()
 
         self.icon = pystray.Icon(
             "wechat_kb",
@@ -179,11 +200,17 @@ class TrayApp:
         self._stop_hotkey()
         if self.hotkey_thread is not None:
             self.hotkey_thread.join(timeout=3)
+        if self.message_watcher is not None:
+            try:
+                self.message_watcher.close()
+            except Exception:
+                LOG.exception("关闭消息聚合失败")
         if self.pipeline is not None:
             try:
                 self.pipeline.close()
             except Exception:
                 LOG.exception("关闭 ingest 失败")
+        status_bus.write_status(running=False, scanning=False, paused=True)
         LOG.info("托盘已退出")
 
     # ------------------------------------------------------------------ 菜单
@@ -194,6 +221,7 @@ class TrayApp:
                 self._toggle_pause,
             ),
             pystray.MenuItem("立即扫描 (Ctrl+Alt+S)", self._scan_now),
+            pystray.MenuItem("状态面板", self._open_panel),
             pystray.MenuItem("查看日志", self._open_log),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("退出", self._quit),
@@ -206,20 +234,26 @@ class TrayApp:
         draw.text((16, 21), "KB", fill="white")
         return image
 
-    def _toggle_pause(self, icon: pystray.Icon, item: Any) -> None:
-        if self.paused.is_set():
-            self.paused.clear()
-            LOG.info("已恢复监听")
-        else:
+    def _set_paused(self, paused: bool) -> None:
+        if paused:
             self.paused.set()
             LOG.info(
                 "已暂停监听（Ctrl+Alt+K 与自动扫描停止；"
                 "手动「立即扫描」和 Ctrl+Alt+S 仍可用）"
             )
-        icon.update_menu()
+        else:
+            self.paused.clear()
+            LOG.info("已恢复监听")
+        status_bus.write_status(paused=paused)
+        if self.icon is not None:
+            self.icon.update_menu()
 
-    def _scan_now(self, icon: pystray.Icon, item: Any) -> None:
+    def _toggle_pause(self, icon: pystray.Icon, item: Any) -> None:
+        self._set_paused(not self.paused.is_set())
+
+    def _trigger_scan(self) -> None:
         LOG.info("手动触发扫描：遍历当前可见的全部卡片")
+        status_bus.write_status(scanning=True)
         threading.Thread(
             target=self._run_scan,
             kwargs={
@@ -230,6 +264,56 @@ class TrayApp:
             name="scan-now",
             daemon=True,
         ).start()
+
+    def _scan_now(self, icon: pystray.Icon, item: Any) -> None:
+        self._trigger_scan()
+
+    def _open_panel(self, icon: pystray.Icon, item: Any) -> None:
+        panel = Path(__file__).with_name("status_panel.py")
+        try:
+            subprocess.Popen(
+                [sys.executable, str(panel)],
+                cwd=str(Path(__file__).parent),
+                close_fds=True,
+            )
+        except Exception:
+            LOG.exception("打开状态面板失败")
+
+    def _today_count(self) -> int:
+        today = datetime.now().strftime("%Y-%m-%d")
+        count = 0
+        try:
+            for path in OUTPUT_DIR.glob("*.md"):
+                if datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d") == today:
+                    count += 1
+        except OSError:
+            pass
+        return count
+
+    def _recent_files(self) -> list[str]:
+        try:
+            paths = sorted(
+                OUTPUT_DIR.glob("*.md"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:8]
+            return [p.name for p in paths]
+        except OSError:
+            return []
+
+    def _command_loop(self) -> None:
+        while not self.stop_event.wait(1.0):
+            command = status_bus.pop_command()
+            if not command:
+                continue
+            name = command.get("command")
+            LOG.info("面板命令：%s", name)
+            if name == "scan":
+                self._trigger_scan()
+            elif name == "toggle_pause":
+                self._set_paused(not self.paused.is_set())
+            elif name == "quit":
+                self._quit(self.icon, None)
 
     def _open_log(self, icon: pystray.Icon, item: Any) -> None:
         target = chat_watcher.LOG_PATH
@@ -244,7 +328,8 @@ class TrayApp:
         LOG.info("收到退出指令")
         self.stop_event.set()
         self._stop_hotkey()
-        icon.stop()
+        if icon is not None:
+            icon.stop()
 
     # ------------------------------------------------------------------ 扫描
     def _scan_loop(self) -> None:
@@ -295,9 +380,23 @@ class TrayApp:
                     argv.append("--dry-run")
                 LOG.info("开始扫描：%s", " ".join(argv))
                 code = chat_watcher.run(chat_watcher.parse_args(argv))
+
+                # 记录卡片处理完后，再扫一遍普通单条消息（15 秒聚合在 watcher 内）
+                if self.message_watcher is not None:
+                    self.message_watcher.scan_once()
+
                 LOG.info("扫描结束，返回 %s", code)
-        except Exception:
+                status_bus.write_status(
+                    scanning=False,
+                    last_scan_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    last_scan_result=f"返回 {code}",
+                    today_archived=self._today_count(),
+                    recent_files=self._recent_files(),
+                    last_error="",
+                )
+        except Exception as exc:
             LOG.exception("扫描异常")
+            status_bus.write_status(scanning=False, last_error=str(exc))
         finally:
             self.scan_lock.release()
 
@@ -346,8 +445,15 @@ class TrayApp:
             with self.ui_lock:
                 ok = hotkey_capture.handle_clipboard(self.pipeline, self.dry_run)
             LOG.info("热键处理完成：%s", "submitted" if ok else "empty/duplicate")
-        except Exception:
+            status_bus.write_status(
+                last_hotkey_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                last_hotkey_result="submitted" if ok else "empty/duplicate",
+                today_archived=self._today_count(),
+                recent_files=self._recent_files(),
+            )
+        except Exception as exc:
             LOG.exception("热键处理失败")
+            status_bus.write_status(last_error=str(exc))
 
     def _on_scan_hotkey(self) -> None:
         """Ctrl+Alt+S：忽略空闲检测，遍历当前可见的全部卡片。"""

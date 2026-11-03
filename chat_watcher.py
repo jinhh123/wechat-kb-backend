@@ -29,6 +29,7 @@ import asyncio
 import ctypes
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -201,18 +202,29 @@ def looks_like_card_title(text: str) -> bool:
 
 
 def current_chat_name(image) -> str:
-    """从主窗口顶部右侧读当前聊天标题（微信 4.x 自绘，只能 OCR）。"""
+    """
+    从主窗口顶部右侧读当前聊天标题（微信 4.x 自绘，只能 OCR）。
+
+    顶部会混入搜索图标/未读圆点等单字符（实测有个 'O'），
+    必须优先取含中文的候选，否则会把 'O' 当成聊天名。
+    """
     boxes = asyncio.run(rc.ocr_boxes(image))
     candidates: list[str] = []
+    chinese: list[str] = []
+
     for top, left, _right, _bottom, text in boxes:
         if top > image.height * 0.16:
             continue
         if left < image.width * 0.30:
             continue
         value = (text or "").strip()
-        if value:
-            candidates.append(value)
-    return candidates[0] if candidates else ""
+        if not value:
+            continue
+        candidates.append(value)
+        if re.search(r"[\u4e00-\u9fff]", value):
+            chinese.append(value)
+
+    return (chinese or candidates)[0] if (chinese or candidates) else ""
 
 
 def scan_cards_from_image(image) -> list[Card]:
