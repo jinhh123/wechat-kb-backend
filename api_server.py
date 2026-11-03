@@ -108,6 +108,13 @@ class ControlCommand(BaseModel):
     command: str
 
 
+class MergeRequest(BaseModel):
+    filenames: list[str]
+    title: str = ""
+    type: str = "knowledge"
+    tags: list[str] = []
+
+
 # =============================================================================
 # 解析工具
 # =============================================================================
@@ -410,6 +417,56 @@ def control(cmd: ControlCommand) -> dict[str, Any]:
     return {"ok": True, "command": command}
 
 
+@app.post("/api/knowledge/merge", response_model=KnowledgeItem, summary="合并多张知识卡片")
+def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
+    if len(req.filenames) < 2:
+        raise HTTPException(status_code=400, detail="至少选择两张卡片")
+
+    root = KNOWLEDGE_DIR.resolve()
+    items: list[KnowledgeItem] = []
+    for name in req.filenames:
+        path = (KNOWLEDGE_DIR / name).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"非法文件名：{name}")
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"文件不存在：{name}")
+        _, item = load_item(path)
+        items.append(item)
+
+    title = (req.title or "").strip() or f"合并知识-{datetime.now():%Y%m%d-%H%M}"
+    doc_type = req.type if req.type in {"schedule", "knowledge"} else "knowledge"
+    tags = list(dict.fromkeys([*req.tags, "合并"]))
+
+    body_parts = []
+    for item in items:
+        body_parts.append(f"## {item.title}\n\n{item.content}")
+    body = "\n\n---\n\n".join(body_parts)
+
+    post = frontmatter.Post(
+        body,
+        type=doc_type,
+        title=title,
+        source="合并",
+        date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        tags=tags,
+        merged_from=[item.filename for item in items],
+    )
+
+    safe_title = re.sub(r'[\\/:*?"<>|]+', "-", title).strip() or "合并知识"
+    stem = f"{datetime.now():%Y-%m-%d}-{safe_title}"
+    target = KNOWLEDGE_DIR / f"{stem}.md"
+    index = 2
+    while target.exists():
+        target = KNOWLEDGE_DIR / f"{stem}-{index}.md"
+        index += 1
+
+    target.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8", newline="\n")
+    _, created = load_item(target)
+    return created
+
+
 @app.post("/api/open/{target}", summary="打开日志或知识库目录")
 def open_target(target: str) -> dict[str, Any]:
     if target == "log":
@@ -441,6 +498,10 @@ def get_knowledge() -> list[KnowledgeItem]:
 # =============================================================================
 # Vue 构建产物（可选）：dist 存在时，直接由 8000 端口提供 /console、/knowledge
 # =============================================================================
+_images = KNOWLEDGE_DIR / "images"
+if _images.is_dir():
+    app.mount("/images", StaticFiles(directory=str(_images)), name="images")
+
 if FRONTEND_DIST.is_dir():
     _assets = FRONTEND_DIST / "assets"
     if _assets.is_dir():
