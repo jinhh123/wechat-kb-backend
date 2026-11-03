@@ -565,6 +565,18 @@ def merge_knowledge(req: MergeRequest) -> KnowledgeItem:
         paths.append(path)
         items.append(item)
 
+    already_merged = [
+        item.filename for item in items if item.is_merged or item.merged_into
+    ]
+    if already_merged:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "以下卡片已经合并过，不能再次合并："
+                + "、".join(already_merged)
+            ),
+        )
+
     title = (req.title or "").strip() or f"合并知识-{datetime.now():%Y%m%d-%H%M}"
     doc_type = req.type if req.type in {"schedule", "knowledge"} else "knowledge"
     tags = list(dict.fromkeys([*req.tags, "合并"]))
