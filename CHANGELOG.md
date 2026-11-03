@@ -8,6 +8,8 @@
 - 分类拖拽后调用后端，把 `category` 写回 Markdown 的 YAML frontmatter；写回失败回滚并显示“未同步”。
 - 新增“一键迁移旧分类到文件”按钮，把浏览器残留分类批量写回 Markdown。
 - 知识库顶部搜索支持 300ms 防抖，匹配标题、正文、分类、标签。
+- 新增 `start_services.py` / `start_tray.vbs` 静默启动链：API + 托盘统一后台启动，无控制台黑框。
+- `start_tray.bat`、`start_api.bat` 改为调用静默 VBS；开机自启同时拉起 API。
 - 新增“粘贴链接”按钮和后端 `/api/knowledge/link`，同 URL 自动去重。
 - 详情弹窗新增“添加到日程”，使用 `YYYY-MM-DD` 标准日期，localStorage 只存 200 字摘要。
 - 本地 API 写操作加 `LOCAL_API_TOKEN` 校验，CORS 限制为本机前端。

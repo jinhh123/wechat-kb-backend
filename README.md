@@ -64,14 +64,30 @@ cd D:\CodeBuddyWorkSpace\wechat
 # 安装依赖（建议国内镜像）
 .\venv\Scripts\pip.exe install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 
-# 启动托盘
-.\venv\Scripts\pythonw.exe tray_app.py --scroll-history --scroll-pages 5
+# 推荐：静默启动 API + 托盘（无黑框）
+start_tray.vbs
 
-# 或双击
+# 或双击桌面「微信知识库采集」快捷方式
+# 或 bat（会闪一下后自动退出，实际仍由 VBS 隐藏启动）
 start_tray.bat
 
-# 推荐：打开桌面管家（含一键启动全部）
+# 打开桌面管家（含一键启动全部）
 start_control_center.bat
+```
+
+`start_tray.vbs` 会调用 `start_services.py`，同时拉起：
+
+- FastAPI（127.0.0.1:8000）
+- 托盘程序
+
+两个进程都不显示控制台窗口；API 已运行时会跳过，托盘有单实例互斥，重复双击安全。
+
+`start_api.bat` 也已整合为同一条静默启动链，不再直接运行 `python.exe`，不会弹 FastAPI 黑框。
+
+启动结果写入：
+
+```
+D:\KnowledgeBase\launcher.log
 ```
 
 开机自启：
@@ -79,6 +95,8 @@ start_control_center.bat
 ```powershell
 install_autostart.bat
 ```
+
+自启同样走 `start_tray.vbs`，会同时启动 API 和托盘，不会弹黑框。
 
 卸载：
 

@@ -1,26 +1,12 @@
 @echo off
-chcp 65001 >nul
 setlocal EnableExtensions
-
-rem ============================================================
-rem 微信知识库采集托盘（无黑框常驻）
-rem %~dp0 为本 bat 所在目录，整个项目移动后仍可用
-rem ============================================================
-
-set "ROOT=%~dp0"
-cd /d "%ROOT%"
-
-if not exist "%ROOT%venv\Scripts\pythonw.exe" (
-    echo [错误] 没找到虚拟环境：%ROOT%venv\Scripts\pythonw.exe
+rem 静默启动 API + 托盘；真正的隐藏逻辑在 start_tray.vbs
+rem 双击 bat 时只闪一下这个窗口，随后自动退出；推荐直接使用 start_tray.vbs / 桌面快捷方式
+cd /d "%~dp0"
+if not exist "%~dp0start_tray.vbs" (
+    echo [错误] 没找到 start_tray.vbs
     pause
     exit /b 1
 )
-
-if not exist "%ROOT%tray_app.py" (
-    echo [错误] 没找到 tray_app.py
-    pause
-    exit /b 1
-)
-
-start "" "%ROOT%venv\Scripts\pythonw.exe" "%ROOT%tray_app.py" --scroll-history --scroll-pages 5 %*
+start "" wscript.exe "%~dp0start_tray.vbs"
 exit /b 0
